@@ -58,9 +58,19 @@ Settings are saved to `~/.srt_audio_bridge.json` when you press Start and when y
 
 - **Inputs:** SRT (caller, listener or rendezvous, with latency, passphrase, stream ID) and a local input device, each with its own level meter. An input only runs while an output uses it. With an audio+video SRT feed, the first audio track is used.
 - **Monitor:** what it plays (SRT input or local input), output device, volume, mute and buffer size can all be changed while running. **Devices** rescans without stopping. Inputs aren't mixed: the monitor plays one at a time.
-- **SRT out:** MPEG-TS with AAC, MP2, Opus or PCM (SMPTE 302M). Keeps the link up with silence while its input is down. What it sends and its settings apply when you press Start or Restart.
+- **SRT out:** MPEG-TS with AAC, MP2, Opus or PCM (SMPTE 302M), tuned for low latency: each audio frame is sent as soon as it is encoded (one PES packet per frame, no mux preload), and Opus uses its low-delay mode with 10 ms frames. Keeps the link up with silence while its input is down. What it sends and its settings apply when you press Start or Restart.
+- **SRT URLs:** built from the fields, always with `transtype=live`, and shown under them. Tick **Edit URL** to type the URL yourself, for SRT options the fields don't cover (for example `rcvbuf` or `tlpktdrop`). It is then passed to ffmpeg exactly as typed. The edited URL shows the passphrase in plain text. Unless "Save passphrases" is ticked, the passphrase is removed from the URL when settings are saved.
 - **Reconnects:** SRT in and SRT out reconnect on their own and independently, so a dead destination never stops monitoring, and a dropped programme feed never stops your mic going out.
-- **Latency:** bursts of old audio (after a reconnect or ffmpeg's start-up probe) are dropped instead of becoming permanent delay. Measured end to end with two 120 ms SRT hops: about 400 ms with AAC, MP2 or Opus, about 340 ms with PCM.
+- **Latency:** set SRT latency per endpoint; anything from 0 ms up is accepted, and the presets start at 20 ms. SRT uses the larger of the two ends' latencies, so the far end has to be set low too. Low values leave less time to resend lost packets, so only go low on a clean network. **Low-latency start** (default) and **Raw low latency** (`probesize=32`) make the SRT input decode almost at once after connecting; raw is about 40 ms faster to the first audio and slightly lower in steady state. Bursts of old audio (after a reconnect or ffmpeg's start-up probe) are dropped instead of becoming permanent delay. The monitor's buffer can go down to 20 ms.
+- **Measured** end to end through two SRT hops, including the test's own sending encoder (AAC) and receiver:
+
+  | SRT latency per hop | Output codec | End to end |
+  |---|---|---|
+  | 120 ms | AAC | ~380 ms |
+  | 20 ms, raw low latency | AAC | ~165 ms |
+  | 20 ms, raw low latency | MP2 | ~145 ms |
+  | 20 ms, raw low latency | Opus | ~135 ms |
+  | 20 ms, raw low latency | PCM (SMPTE 302M) | ~105 ms |
 - **Shutdown:** closing the window, Ctrl+C or SIGTERM stops ffmpeg cleanly. On Windows, ffmpeg is also ended if the app crashes or is killed, so no stray ffmpeg keeps holding an SRT port.
 
 ## Platform notes
@@ -94,10 +104,11 @@ You need Go 1.24+ and a C compiler, because miniaudio and the GUI toolkit ([Fyne
 go test ./...                                                  # unit tests + end-to-end tests
 go test ./internal/bridge -run Talkback -v                     # hear SRT in while sending the mic
 go test ./internal/bridge -run Relay -v -args -relay.codec=Opus   # relay with another output codec
+go test ./internal/bridge -run Relay/calls -v -args -relay.latency=20 -relay.raw -relay.fast-harness   # lowest latency
 go test -short ./...                                           # skip the end-to-end tests
 ```
 
 The end-to-end tests run real ffmpeg and SRT but need no sound card:
 
 - **Talkback:** a programme feed arrives over SRT while a mic tone goes out, at the same time. The test checks that the monitor plays the feed, the far end receives the mic, and switching the monitor to the mic works while running. The mic and monitor are stand-ins.
-- **Relay:** tone pulses go over SRT through the engine to a receiver, once with the bridge calling the destination and once with the destination joining 5 s late. It checks every pulse arrives intact within the latency limit.
+- **Relay:** tone pulses go over SRT through the engine to a receiver: with the bridge calling the destination, with the destination joining 5 s late, and through hand-edited URLs. It checks every pulse arrives intact within the latency limit and logs the median latency.

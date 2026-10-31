@@ -34,6 +34,9 @@ func TestSettingsRoundTrip(t *testing.T) {
 	cfg.KeepaliveSilence = false
 	cfg.SavePassphrases = true
 	cfg.FFmpeg = `C:\tools\ffmpeg.exe`
+	cfg.RawLowLatency = true
+	cfg.SrtOut.UseCustomURL = true
+	cfg.SrtOut.CustomURL = "srt://10.0.0.9:9300?mode=caller&latency=20000&rcvbuf=1000000"
 
 	u := newTestUI(t, cfg)
 	got, err := u.collect()
@@ -99,5 +102,33 @@ func TestCollectReportsBadInput(t *testing.T) {
 	u.buffer.SetText("5")
 	if _, err := u.collect(); err == nil || !strings.Contains(err.Error(), "20-1000") {
 		t.Errorf("got %v", err)
+	}
+}
+
+func TestEditURL(t *testing.T) {
+	u := newTestUI(t, bridge.DefaultConfig())
+	u.in.edit.SetChecked(true) // starts from the URL the fields give
+	if !strings.HasPrefix(u.in.custom.Text, "srt://0.0.0.0:9000?mode=listener&transtype=live&latency=120000") {
+		t.Errorf("prefilled %q", u.in.custom.Text)
+	}
+	if !u.in.port.Disabled() || u.in.custom.Hidden || !u.in.url.Hidden {
+		t.Error("while editing the URL, the fields should be greyed out and the editor shown")
+	}
+	u.in.custom.SetText("srt://:9000?mode=pull")
+	if !strings.Contains(u.in.hint.seg.Text, "unknown mode") {
+		t.Errorf("hint %q", u.in.hint.seg.Text)
+	}
+	u.in.custom.SetText("srt://:9050?mode=listener&latency=20000")
+	cfg, err := u.collect()
+	if err != nil || !cfg.SrtIn.UseCustomURL || cfg.SrtIn.CustomURL != "srt://:9050?mode=listener&latency=20000" {
+		t.Errorf("collect: %v %+v", err, cfg.SrtIn)
+	}
+	u.in.edit.SetChecked(false)
+	if u.in.port.Disabled() || !u.in.custom.Hidden {
+		t.Error("turning Edit URL off should bring the fields back")
+	}
+	u.rawLatency.SetChecked(true)
+	if !u.lowLatency.Disabled() {
+		t.Error("raw low latency should grey out low-latency start")
 	}
 }

@@ -41,6 +41,18 @@ func newMutedText(text string, bold bool) *mutedText {
 	return &mutedText{RichText: widget.NewRichText(seg), seg: seg}
 }
 
+// setWarning switches between the muted color and the warning color.
+func (m *mutedText) setWarning(on bool) {
+	c := theme.ColorNamePlaceHolder
+	if on {
+		c = theme.ColorNameWarning
+	}
+	if m.seg.Style.ColorName != c {
+		m.seg.Style.ColorName = c
+		m.Refresh()
+	}
+}
+
 func (m *mutedText) SetText(text string) {
 	if m.seg.Text != text {
 		m.seg.Text = text

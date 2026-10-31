@@ -3,7 +3,6 @@ package bridge
 import (
 	"fmt"
 	"io"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -84,7 +83,13 @@ func newSrtSource(cfg Config, ffmpeg string, onPCM func([]byte), log func(string
 
 func (s *srtSource) command() []string {
 	cmd := []string{s.ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "warning"}
-	if s.cfg.LowLatencyInput {
+	switch {
+	case s.cfg.RawLowLatency:
+		// Smallest probe ffmpeg allows: decoding starts with the first packets
+		// (verified with AAC, MP2, Opus and SMPTE 302M in MPEG-TS, ffmpeg 6.1).
+		cmd = append(cmd, "-fflags", "nobuffer", "-flags", "low_delay",
+			"-probesize", "32", "-analyzeduration", "0")
+	case s.cfg.LowLatencyInput:
 		cmd = append(cmd, "-fflags", "nobuffer", "-flags", "low_delay",
 			"-probesize", "32768", "-analyzeduration", "250000")
 	}
@@ -122,16 +127,12 @@ func (s *srtSource) status() (string, string) {
 
 func (s *srtSource) run() {
 	defer close(s.ctl.done)
-	ep := s.cfg.SrtIn
-	host := strings.TrimSpace(ep.Host)
-	if host == "" {
-		host = "0.0.0.0"
-	}
-	where := fmt.Sprintf("%s:%d", host, ep.Port)
+	mode, host, port, _ := s.cfg.SrtIn.Target() // validated before start
+	where := fmt.Sprintf("%s:%d", host, port)
 	backoff := time.Second
 	first := true
 	for !s.ctl.stopped() {
-		if ep.Mode == "listener" {
+		if mode == "listener" {
 			s.set("connecting", "listening on "+where)
 		} else {
 			s.set("connecting", "connecting to "+where)
@@ -181,7 +182,7 @@ func (s *srtSource) run() {
 		s.set("reconnecting", fmt.Sprintf("retry in %.0f s", backoff.Seconds()))
 		s.ctl.sleep(backoff)
 		// a listener should be back on its port quickly; a caller backs off
-		if ep.Mode == "listener" {
+		if mode == "listener" {
 			backoff = time.Second
 		} else {
 			backoff = min(backoff*2, 8*time.Second)
