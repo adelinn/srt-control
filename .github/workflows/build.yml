@@ -1,0 +1,137 @@
+name: Build
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (Linux)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install ffmpeg and GUI build headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ffmpeg libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev
+      - run: go vet ./...
+      - name: Test (includes the end-to-end SRT relay through real ffmpeg)
+        run: go test -race -v ./...
+
+  windows:
+    name: Windows amd64
+    # Cross-compiled with MinGW: same result as a Windows runner, faster, and
+    # reproducible on any Linux box (see README "Build from source").
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Cache Go build for Windows
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-windows-amd64-${{ hashFiles('go.sum') }}
+          restore-keys: go-windows-amd64-
+      - name: Install MinGW-w64
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64
+      - name: Version
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then v="$GITHUB_REF_NAME"; else v="dev-${GITHUB_SHA::7}"; fi
+          n=$(echo "$v" | grep -oE '^v[0-9]+\.[0-9]+\.[0-9]+' | tr -d v || true)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "numeric=${n:-0.0.0}.0" >> "$GITHUB_OUTPUT"
+      - name: Windows resources (icon, manifest, version info)
+        working-directory: cmd/srt-audio-bridge
+        run: |
+          go run github.com/tc-hib/go-winres@v0.3.3 simply --arch amd64 \
+            --icon ../../internal/gui/icon.png --manifest gui \
+            --product-name "SRT Audio Bridge" --file-description "SRT Audio Bridge" \
+            --product-version "${{ steps.version.outputs.numeric }}" \
+            --file-version "${{ steps.version.outputs.numeric }}" \
+            --original-filename srt-audio-bridge.exe
+      - name: Build
+        env:
+          CGO_ENABLED: "1"
+          GOOS: windows
+          GOARCH: amd64
+          CC: x86_64-w64-mingw32-gcc
+        run: |
+          flags="-s -w -X main.version=${{ steps.version.outputs.version }}"
+          # GUI build (no console window) and the same program as a console app
+          # for -headless, -list-devices and seeing the log in a terminal.
+          go build -trimpath -ldflags "$flags -H=windowsgui" -o dist/srt-audio-bridge.exe ./cmd/srt-audio-bridge
+          go build -trimpath -ldflags "$flags" -o dist/srt-audio-bridge.console.exe ./cmd/srt-audio-bridge
+          cp README.md dist/
+      - name: Check the exes only need system DLLs
+        run: |
+          for f in dist/*.exe; do
+            dlls=$(x86_64-w64-mingw32-objdump -p "$f" | awk '/DLL Name/{print $3}')
+            echo "$f: $(echo $dlls)"
+            if echo "$dlls" | grep -viqE '^(kernel32|user32|gdi32|shell32|opengl32|msvcrt|advapi32|ole32|winmm|ws2_32)\.dll$'; then
+              echo "::error file=$f::unexpected DLL dependency"; exit 1
+            fi
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: srt-audio-bridge-windows-amd64
+          path: dist/
+          if-no-files-found: error
+
+  # macOS comes later. cgo needs Apple's SDK, so it builds on a macOS runner
+  # rather than cross-compiling. Roughly:
+  #
+  # macos:
+  #   name: macOS arm64
+  #   runs-on: macos-latest
+  #   steps:
+  #     - uses: actions/checkout@v5
+  #     - uses: actions/setup-go@v5
+  #       with:
+  #         go-version-file: go.mod
+  #     - run: go build -trimpath -ldflags "-s -w" -o dist/srt-audio-bridge ./cmd/srt-audio-bridge
+  #     # then a .app bundle (fyne package -os darwin), signing and notarization
+  #     - uses: actions/upload-artifact@v4
+  #       with:
+  #         name: srt-audio-bridge-macos-arm64
+  #         path: dist/
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: srt-audio-bridge-windows-amd64
+          path: srt-audio-bridge-windows-amd64
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          zip -r "srt-audio-bridge-$GITHUB_REF_NAME-windows-amd64.zip" srt-audio-bridge-windows-amd64
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes \
+            "srt-audio-bridge-$GITHUB_REF_NAME-windows-amd64.zip"

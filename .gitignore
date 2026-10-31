@@ -1,10 +1,10 @@
-__pycache__/
-*.pyc
-.venv/
-venv/
+# build output
+dist/
+*.exe
+*.syso
+/srt-audio-bridge
+
+# local test files
 *.raw
 *.wav
 *.log
-dist/
-build/
-*.spec
