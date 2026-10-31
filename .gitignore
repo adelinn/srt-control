@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.raw
+*.wav
+*.log
+dist/
+build/
+*.spec
