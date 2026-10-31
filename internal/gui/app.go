@@ -40,9 +40,25 @@ const (
 var (
 	latencyChoices = []string{"20", "50", "80", "120", "200", "300", "500", "1000", "2000"}
 	bufferChoices  = []string{"20", "40", "60", "80", "100", "150", "200", "300", "500", "1000"}
-	sourceLabels   = []string{"SRT stream", "Local input device"}
-	sourceKeys     = []string{"srt", "device"}
+	// what the monitor plays and SRT out sends
+	routeLabels = []string{"SRT input", "Local input"}
+	routeKeys   = []string{bridge.FromSRT, bridge.FromDevice}
 )
+
+func routeKey(r *widget.RadioGroup) string {
+	if r.Selected == routeLabels[1] {
+		return routeKeys[1]
+	}
+	return routeKeys[0]
+}
+
+func setRoute(r *widget.RadioGroup, key string) {
+	if key == routeKeys[1] {
+		r.SetSelected(routeLabels[1])
+	} else {
+		r.SetSelected(routeLabels[0])
+	}
+}
 
 // srtForm is the set of fields for one SRT endpoint, with a hint and a
 // preview of the URL ffmpeg will get (passphrase masked).
@@ -177,22 +193,23 @@ type ui struct {
 	logView   *widget.Label
 	logScroll *container.Scroll
 
-	meter   *levelMeter
-	meterDB [bridge.Channels]float64
-	tick    int
+	meterSRT, meterInput *levelMeter
+	dbSRT, dbInput       [bridge.Channels]float64
+	tick                 int
 
 	btnStart, btnStop *widget.Button
 	badge             *stateBadge
 	api               *widget.Select
-	source            *widget.RadioGroup
 	in, out           *srtForm
 	lowLatency        *widget.Check
 	inDevice          *widget.Select
 	send              *widget.Check
+	sendFrom          *widget.RadioGroup
 	codec             *widget.Select
 	bitrate           *widget.SelectEntry
 	keepalive         *widget.Check
 	monitor           *widget.Check
+	monitorFrom       *widget.RadioGroup
 	outDevice         *widget.Select
 	volume            *widget.Slider
 	volumeLabel       *widget.Label
@@ -201,7 +218,8 @@ type ui struct {
 	ffmpeg            *widget.Entry
 	ffInfo            *widget.Label
 	savePass          *widget.Check
-	lightSource       *statusLight
+	lightSRT          *statusLight
+	lightInput        *statusLight
 	lightMonitor      *statusLight
 	lightSender       *statusLight
 
@@ -225,7 +243,8 @@ func Run(cfgPath string) {
 	a := app.NewWithID("io.github.adelinn.srt-audio-bridge")
 	a.Settings().SetTheme(bridgeTheme{})
 	a.SetIcon(fyne.NewStaticResource("icon.png", iconPNG))
-	u := &ui{app: a, cfgPath: cfgPath, meterDB: [bridge.Channels]float64{-90, -90}, quit: make(chan struct{})}
+	silent := [bridge.Channels]float64{-90, -90}
+	u := &ui{app: a, cfgPath: cfgPath, quit: make(chan struct{}), dbSRT: silent, dbInput: silent}
 	u.win = a.NewWindow(appName)
 	cfg, err := bridge.LoadConfig(cfgPath)
 	if err != nil {
@@ -310,33 +329,41 @@ func (u *ui) build() fyne.CanvasObject {
 		container.New(layout.NewCustomPaddedHBoxLayout(8), withWidth(u.btnStart, 108), u.btnStop, u.badge),
 		container.NewHBox(widget.NewLabel("Audio API"), withWidth(u.api, 150), rescan))
 
-	// source
+	// Inputs on the left, outputs on the right; each output picks its input.
+	// SRT input
 	u.in = newSrtForm()
-	u.source = widget.NewRadioGroup(sourceLabels, func(string) { u.updateEnabled() })
-	u.source.Horizontal = true
-	u.source.Required = true
 	u.lowLatency = widget.NewCheck("Low-latency start (smaller probe)", nil)
-	u.inDevice = widget.NewSelect(nil, nil)
-	src := newPanel("Source", nil, container.NewVBox(
-		u.source, u.in.box, u.lowLatency,
-		container.NewBorder(nil, nil, widget.NewLabel("Input device"), nil, u.inDevice)))
+	u.meterSRT = newLevelMeter()
+	u.lightSRT = newStatusLight()
+	srtIn := newPanel("SRT input", u.lightSRT, nil, container.NewVBox(u.in.box, u.lowLatency, u.meterSRT))
 
-	// destination
+	// local input
+	u.inDevice = widget.NewSelect(nil, nil)
+	u.meterInput = newLevelMeter()
+	u.lightInput = newStatusLight()
+	local := newPanel("Local input", u.lightInput, nil, container.NewVBox(
+		container.NewBorder(nil, nil, widget.NewLabel("Device"), nil, u.inDevice), u.meterInput))
+
+	// SRT output
 	u.out = newSrtForm()
-	u.send = widget.NewCheck("Send over SRT", func(bool) { u.updateEnabled() })
+	u.send = widget.NewCheck("Send", func(bool) { u.updateEnabled() })
+	u.sendFrom = newRouteChoice(func(string) {})
 	u.codec = widget.NewSelect(bridge.Codecs, func(string) { u.updateEnabled() })
 	bitrates := make([]string, len(bridge.Bitrates))
 	for i, b := range bridge.Bitrates {
 		bitrates[i] = strconv.Itoa(b)
 	}
 	u.bitrate = widget.NewSelectEntry(bitrates)
-	u.keepalive = widget.NewCheck("Send silence while the source is down (keeps the link up)", nil)
+	u.keepalive = widget.NewCheck("Send silence while the input is down (keeps the link up)", nil)
 	enc := container.NewHBox(widget.NewLabel("Codec"), withWidth(u.codec, 170),
 		widget.NewLabel("Bitrate"), withWidth(u.bitrate, 82), widget.NewLabel("kbit/s"))
-	dst := newPanel("SRT output", u.send, container.NewVBox(u.out.box, enc, u.keepalive))
+	u.lightSender = newStatusLight()
+	srtOut := newPanel("SRT output", u.lightSender, u.send, container.NewVBox(
+		container.NewHBox(widget.NewLabel("Sends"), u.sendFrom), u.out.box, enc, u.keepalive))
 
 	// monitor
-	u.monitor = widget.NewCheck("Monitor", func(bool) { u.monitorChanged() })
+	u.monitor = widget.NewCheck("On", func(bool) { u.monitorChanged() })
+	u.monitorFrom = newRouteChoice(func(string) { u.monitorChanged() })
 	u.outDevice = widget.NewSelect(nil, func(string) { u.monitorChanged() })
 	u.volume = widget.NewSlider(0, 1.5)
 	u.volume.Step = 0.01
@@ -345,24 +372,21 @@ func (u *ui) build() fyne.CanvasObject {
 	u.mute = widget.NewCheck("Mute", func(bool) { u.volumeChanged() })
 	u.buffer = widget.NewSelectEntry(bufferChoices)
 	u.buffer.OnChanged = func(string) { u.bufferChanged() }
-	mon := newPanel("Monitor", nil, container.NewBorder(nil, nil,
-		container.NewHBox(u.monitor, widget.NewLabel("Output")),
-		container.NewHBox(widget.NewLabel("Volume"), withWidth(u.volume, 150), withWidth(u.volumeLabel, 46),
-			u.mute, widget.NewLabel("Buffer"), withWidth(u.buffer, 82), widget.NewLabel("ms")),
-		u.outDevice))
-
-	// levels and status
-	u.meter = newLevelMeter()
-	u.lightSource, u.lightMonitor, u.lightSender = newStatusLight("Source"), newStatusLight("Monitor"), newStatusLight("SRT out")
-	levels := newPanel("Levels & status", nil, container.NewVBox(u.meter,
-		container.New(columns{gap: 12}, u.lightSource.box, u.lightMonitor.box, u.lightSender.box)))
+	u.lightMonitor = newStatusLight()
+	mon := newPanel("Monitor", u.lightMonitor, u.monitor, container.NewVBox(
+		container.NewHBox(widget.NewLabel("Plays"), u.monitorFrom),
+		container.NewBorder(nil, nil, widget.NewLabel("Output"), nil, u.outDevice),
+		container.NewBorder(nil, nil, widget.NewLabel("Volume"),
+			container.NewHBox(withWidth(u.volumeLabel, 46), u.mute,
+				widget.NewLabel("Buffer"), withWidth(u.buffer, 82), widget.NewLabel("ms")),
+			u.volume)))
 
 	// settings
 	u.ffmpeg = widget.NewEntry()
 	u.ffmpeg.SetPlaceHolder("ffmpeg (next to this program, on PATH, or the bundled one)")
 	u.ffInfo = widget.NewLabel("")
 	u.savePass = widget.NewCheck("Save passphrases", nil)
-	settings := newPanel("Settings", nil, container.NewBorder(nil, nil, widget.NewLabel("ffmpeg"),
+	settings := newPanel("Settings", nil, nil, container.NewBorder(nil, nil, widget.NewLabel("ffmpeg"),
 		container.NewHBox(
 			widget.NewButtonWithIcon("Browse…", theme.FolderOpenIcon(), u.browseFFmpeg),
 			widget.NewButton("Check", u.checkFFmpeg),
@@ -381,31 +405,30 @@ func (u *ui) build() fyne.CanvasObject {
 		u.app.Clipboard().SetContent(strings.Join(u.logLines, "\n"))
 	})
 	copyLog.Importance = widget.LowImportance
-	logPanel := newPanel("Log", copyLog, u.logScroll)
+	logPanel := newPanel("Log", nil, copyLog, u.logScroll)
 
 	content := container.New(vstack{gap: 8},
-		toolbar, container.New(columns{gap: 8}, src, dst), mon, levels, settings, logPanel)
+		toolbar,
+		container.New(columns{gap: 8}, srtIn, srtOut),
+		container.New(columns{gap: 8}, local, mon),
+		settings, logPanel)
 	// Scrolls only when the window is smaller than the layout (small or
 	// high-DPI laptop screens); otherwise the log takes the spare height.
 	return container.NewVScroll(container.New(layout.NewCustomPaddedLayout(10, 12, 12, 12), content))
 }
 
-func (u *ui) sourceKey() string {
-	for i, l := range sourceLabels {
-		if u.source.Selected == l {
-			return sourceKeys[i]
-		}
-	}
-	return "srt"
+func newRouteChoice(changed func(string)) *widget.RadioGroup {
+	r := widget.NewRadioGroup(routeLabels, changed)
+	r.Horizontal = true
+	r.Required = true
+	return r
 }
 
 // fill puts the settings into the widgets.
 func (u *ui) fill() {
 	c := u.cfg
-	u.source.SetSelected(sourceLabels[0])
-	if c.Source == "device" {
-		u.source.SetSelected(sourceLabels[1])
-	}
+	setRoute(u.monitorFrom, c.MonitorSource)
+	setRoute(u.sendFrom, c.SendSource)
 	u.in.set(c.SrtIn)
 	u.out.set(c.SrtOut)
 	u.lowLatency.SetChecked(c.LowLatencyInput)
@@ -458,7 +481,8 @@ func (u *ui) collect() (bridge.Config, error) {
 	}
 	return bridge.Config{
 		FFmpeg:           ffmpeg,
-		Source:           u.sourceKey(),
+		MonitorSource:    routeKey(u.monitorFrom),
+		SendSource:       routeKey(u.sendFrom),
 		SrtIn:            in,
 		LowLatencyInput:  u.lowLatency.Checked,
 		HostAPI:          u.api.Selected,
@@ -484,13 +508,12 @@ func deviceValue(label string) string {
 	return label
 }
 
+// updateEnabled greys out the SRT output settings while sending is off. Both
+// inputs stay editable: either can be routed to an output at any time.
 func (u *ui) updateEnabled() {
-	srt := u.sourceKey() == "srt"
-	u.in.setEnabled(srt)
-	enable(u.lowLatency, srt)
-	enable(u.inDevice, !srt)
 	send := u.send.Checked
 	u.out.setEnabled(send)
+	enable(u.sendFrom, send)
 	enable(u.codec, send)
 	enable(u.keepalive, send)
 	enable(u.bitrate, send && !bridge.IsLossless(u.codec.Selected))
@@ -717,7 +740,8 @@ func (u *ui) monitorChanged() {
 		buffer = u.cfg.MonitorBufferMs
 	}
 	buffer = min(1000, max(20, buffer))
-	if err := u.engine.SetMonitor(u.monitor.Checked, u.api.Selected, deviceValue(u.outDevice.Selected), buffer); err != nil {
+	if err := u.engine.SetMonitor(u.monitor.Checked, routeKey(u.monitorFrom), u.api.Selected,
+		deviceValue(u.outDevice.Selected), buffer); err != nil {
 		u.log("Monitor: " + err.Error())
 	}
 }
@@ -756,15 +780,19 @@ func (u *ui) poll() {
 		u.logScroll.ScrollToBottom()
 	}
 
-	var peaks [bridge.Channels]float64
+	var peaks bridge.Peaks
 	if u.engine != nil {
 		peaks = u.engine.TakePeaks()
 	}
-	for i, p := range peaks {
-		db := 20 * math.Log10(max(p, 1e-5))
-		u.meterDB[i] = max(db, u.meterDB[i]-1.2) // ~24 dB/s fall-back
+	fall := func(db *[bridge.Channels]float64, p [bridge.Channels]float64) {
+		for i := range p {
+			db[i] = max(20*math.Log10(max(p[i], 1e-5)), db[i]-1.2) // ~24 dB/s fall-back
+		}
 	}
-	u.meter.setLevels(u.meterDB)
+	fall(&u.dbSRT, peaks.SrtIn)
+	fall(&u.dbInput, peaks.Input)
+	u.meterSRT.setLevels(u.dbSRT)
+	u.meterInput.setLevels(u.dbInput)
 
 	if u.tick++; u.tick%5 == 0 {
 		u.updateStatus()
@@ -773,27 +801,41 @@ func (u *ui) poll() {
 
 func (u *ui) updateStatus() {
 	off := bridge.ComponentStatus{State: "off"}
-	st := bridge.Status{Source: off, Monitor: off, Sender: off}
+	st := bridge.Status{SrtIn: off, Input: off, Monitor: off, Sender: off}
 	if u.engine != nil {
 		st = u.engine.Snapshot()
 	}
-	u.lightSource.set(st.Source.State, st.Source.Detail)
+	u.lightSRT.set(st.SrtIn.State, st.SrtIn.Detail)
+	u.lightInput.set(st.Input.State, st.Input.Detail)
 	u.lightMonitor.set(st.Monitor.State, st.Monitor.Detail)
 	u.lightSender.set(st.Sender.State, st.Sender.Detail)
+	u.badge.set(overall(u.engine != nil, st))
+}
 
-	// The badge follows the signal path; the monitor only counts when it fails.
-	switch {
-	case u.engine == nil:
-		u.badge.set("STOPPED", theme.ColorNameDisabled)
-	case st.Source.State == "error" || st.Sender.State == "error" || st.Monitor.State == "error":
-		u.badge.set("ERROR", theme.ColorNameError)
-	case st.Source.State == "no audio":
-		u.badge.set("NO AUDIO", theme.ColorNameWarning)
-	case goodStates[st.Source.State] && (st.Sender.State == "off" || goodStates[st.Sender.State]):
-		u.badge.set("LIVE", theme.ColorNameSuccess)
-	default:
-		u.badge.set("CONNECTING", theme.ColorNameWarning)
+// overall is the badge next to Start/Stop. It follows the inputs in use and
+// SRT out; the monitor only counts when it fails (it shows "buffering" now
+// and then by design).
+func overall(running bool, st bridge.Status) (string, fyne.ThemeColorName) {
+	if !running {
+		return "STOPPED", theme.ColorNameDisabled
 	}
+	parts := []bridge.ComponentStatus{st.SrtIn, st.Input, st.Sender}
+	for _, c := range append(parts, st.Monitor) {
+		if c.State == "error" {
+			return "ERROR", theme.ColorNameError
+		}
+	}
+	for _, c := range parts {
+		if c.State == "no audio" {
+			return "NO AUDIO", theme.ColorNameWarning
+		}
+	}
+	for _, c := range parts {
+		if c.State != "off" && !goodStates[c.State] {
+			return "CONNECTING", theme.ColorNameWarning
+		}
+	}
+	return "LIVE", theme.ColorNameSuccess
 }
 
 func (u *ui) onClose() {

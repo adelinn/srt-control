@@ -102,15 +102,42 @@ func TestLoadPythonSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Source != "device" || cfg.SrtIn.Port != 9100 || cfg.MonitorVolume != 0.5 || cfg.Codec != "MP2" {
+	if cfg.SrtIn.Port != 9100 || cfg.MonitorVolume != 0.5 || cfg.Codec != "MP2" {
 		t.Errorf("loaded %+v", cfg)
 	}
 	if !cfg.SendEnabled || cfg.BitrateK != 192 || cfg.SrtOut.Port != 9001 { // missing keys keep defaults
 		t.Errorf("defaults lost: %+v", cfg)
 	}
+	if cfg.MonitorSource != FromDevice || cfg.SendSource != FromDevice || cfg.Source != "" {
+		t.Errorf(`"source": "device" should route both outputs to the device: %+v`, cfg)
+	}
 	devs := []AudioDevice{{Name: "Mic"}, {Name: "Speakers (Realtek)"}}
 	if d := matchDevice(devs, cfg.MonitorDevice); d == nil || d.Name != "Speakers (Realtek)" {
 		t.Errorf("old device label not matched: %v", d)
+	}
+}
+
+// Routing: an older file's single "source" fills both outputs, new files keep
+// their own routing, and a file without either gets the talkback defaults.
+func TestRoutingMigration(t *testing.T) {
+	dir := t.TempDir()
+	for _, c := range []struct{ json, monitor, send string }{
+		{`{"source": "srt"}`, FromSRT, FromSRT}, // relay, as before
+		{`{"source": "device"}`, FromDevice, FromDevice},
+		{`{"monitor_source": "srt", "send_source": "device"}`, FromSRT, FromDevice},
+		{`{"source": "srt", "monitor_source": "srt", "send_source": "device"}`, FromSRT, FromDevice},
+		{`{"codec": "MP2"}`, FromSRT, FromDevice},
+	} {
+		path := filepath.Join(dir, "cfg.json")
+		_ = os.WriteFile(path, []byte(c.json), 0o600)
+		cfg, err := LoadConfig(path)
+		if err != nil || cfg.MonitorSource != c.monitor || cfg.SendSource != c.send {
+			t.Errorf("%s: monitor %q send %q err %v, want %q %q", c.json, cfg.MonitorSource, cfg.SendSource, err, c.monitor, c.send)
+		}
+		_ = SaveConfig(cfg, path)
+		if data, _ := os.ReadFile(path); strings.Contains(string(data), `"source"`) {
+			t.Errorf("%s: saved file still has the old key", c.json)
+		}
 	}
 }
 

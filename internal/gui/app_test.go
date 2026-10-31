@@ -21,7 +21,8 @@ func newTestUI(t *testing.T, cfg bridge.Config) *ui {
 // Settings must survive the trip into the widgets and back unchanged.
 func TestSettingsRoundTrip(t *testing.T) {
 	cfg := bridge.DefaultConfig()
-	cfg.Source = "device"
+	cfg.MonitorSource = bridge.FromDevice
+	cfg.SendSource = bridge.FromSRT
 	cfg.SrtIn = bridge.SrtEndpoint{Mode: "caller", Host: "10.0.0.2", Port: 9100, LatencyMs: 300, StreamID: "in"}
 	cfg.SrtOut = bridge.SrtEndpoint{Mode: "listener", Port: 9200, LatencyMs: 80, Passphrase: "0123456789abc"}
 	cfg.LowLatencyInput = false
@@ -46,20 +47,42 @@ func TestSettingsRoundTrip(t *testing.T) {
 
 func TestEnabledFollowsChoices(t *testing.T) {
 	u := newTestUI(t, bridge.DefaultConfig())
-	if u.in.host.Disabled() || !u.inDevice.Disabled() {
-		t.Error("SRT source: SRT fields should be enabled, input device disabled")
+	if u.in.host.Disabled() || u.inDevice.Disabled() || u.out.port.Disabled() {
+		t.Error("both inputs and the SRT output should be editable")
 	}
-	u.source.SetSelected("Local input device")
-	if !u.in.host.Disabled() || u.inDevice.Disabled() {
-		t.Error("device source: SRT fields should be disabled, input device enabled")
+	if routeKey(u.monitorFrom) != bridge.FromSRT || routeKey(u.sendFrom) != bridge.FromDevice {
+		t.Error("defaults should hear the SRT input and send the local input")
 	}
 	u.codec.SetSelected("PCM (SMPTE 302M)")
 	if !u.bitrate.Disabled() {
 		t.Error("bitrate should be disabled for PCM")
 	}
 	u.send.SetChecked(false)
-	if !u.out.port.Disabled() || !u.codec.Disabled() {
+	if !u.out.port.Disabled() || !u.codec.Disabled() || !u.sendFrom.Disabled() {
 		t.Error("output fields should be disabled when not sending")
+	}
+	if u.in.host.Disabled() || u.monitorFrom.Disabled() {
+		t.Error("the SRT input and monitor stay usable without sending")
+	}
+}
+
+func TestOverallBadge(t *testing.T) {
+	c := func(s string) bridge.ComponentStatus { return bridge.ComponentStatus{State: s} }
+	for _, tc := range []struct {
+		running bool
+		st      bridge.Status
+		want    string
+	}{
+		{false, bridge.Status{}, "STOPPED"},
+		{true, bridge.Status{SrtIn: c("receiving"), Input: c("capturing"), Monitor: c("buffering"), Sender: c("sending")}, "LIVE"},
+		{true, bridge.Status{SrtIn: c("receiving"), Input: c("off"), Monitor: c("playing"), Sender: c("off")}, "LIVE"},
+		{true, bridge.Status{SrtIn: c("receiving"), Input: c("capturing"), Monitor: c("playing"), Sender: c("connecting")}, "CONNECTING"},
+		{true, bridge.Status{SrtIn: c("no audio"), Input: c("capturing"), Monitor: c("playing"), Sender: c("sending")}, "NO AUDIO"},
+		{true, bridge.Status{SrtIn: c("receiving"), Input: c("capturing"), Monitor: c("error"), Sender: c("sending")}, "ERROR"},
+	} {
+		if got, _ := overall(tc.running, tc.st); got != tc.want {
+			t.Errorf("%+v: got %s, want %s", tc.st, got, tc.want)
+		}
 	}
 }
 

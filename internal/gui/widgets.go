@@ -48,13 +48,18 @@ func (m *mutedText) SetText(text string) {
 	}
 }
 
-func newPanel(title string, trailing, content fyne.CanvasObject) *panel {
+// newPanel makes a section. The title row holds the title, an optional status
+// light and an optional widget on the right.
+func newPanel(title string, status *statusLight, trailing, content fyne.CanvasObject) *panel {
 	if title != "" {
-		head := newMutedText(strings.ToUpper(title), true)
-		var row fyne.CanvasObject = head
-		if trailing != nil {
-			row = container.NewBorder(nil, nil, head, trailing)
+		gap := canvas.NewRectangle(color.Transparent)
+		gap.SetMinSize(fyne.NewSize(6, 0))
+		head := container.NewHBox(newMutedText(strings.ToUpper(title), true), gap)
+		var middle fyne.CanvasObject
+		if status != nil {
+			middle = status.box
 		}
+		row := container.NewBorder(nil, nil, head, trailing, middle)
 		content = container.NewBorder(row, nil, nil, nil, content)
 	}
 	p := &panel{content: content}
@@ -130,19 +135,19 @@ func stateColor(state string) color.Color {
 	return themeColor(theme.ColorNameDisabled)
 }
 
-// statusLight is a colored dot with a "Title: state — detail" line.
+// statusLight is a colored dot with a "state — detail" line, shown in a
+// panel's title row.
 type statusLight struct {
-	title string
-	dot   *canvas.Circle
-	text  *widget.Label
-	box   fyne.CanvasObject
+	dot  *canvas.Circle
+	text *widget.Label
+	box  fyne.CanvasObject
 }
 
-func newStatusLight(title string) *statusLight {
-	l := &statusLight{title: title, dot: canvas.NewCircle(themeColor(theme.ColorNameDisabled))}
-	l.text = widget.NewLabel(title + ": off")
-	l.text.Wrapping = fyne.TextWrapWord
-	dot := container.NewCenter(container.NewGridWrap(fyne.NewSize(10, 10), l.dot))
+func newStatusLight() *statusLight {
+	l := &statusLight{dot: canvas.NewCircle(themeColor(theme.ColorNameDisabled)), text: widget.NewLabel("off")}
+	l.text.SizeName = theme.SizeNameCaptionText
+	l.text.Truncation = fyne.TextTruncateEllipsis
+	dot := container.NewCenter(container.NewGridWrap(fyne.NewSize(9, 9), l.dot))
 	l.box = container.NewBorder(nil, nil, dot, nil, l.text)
 	return l
 }
@@ -150,7 +155,7 @@ func newStatusLight(title string) *statusLight {
 func (l *statusLight) set(state, detail string) {
 	l.dot.FillColor = stateColor(state)
 	l.dot.Refresh()
-	text := l.title + ": " + state
+	text := state
 	if detail != "" {
 		text += " — " + detail
 	}

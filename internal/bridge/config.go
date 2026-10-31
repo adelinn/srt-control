@@ -142,11 +142,21 @@ func escape(s string) string {
 	return b.String()
 }
 
-// Config holds every setting. The JSON layout matches the earlier Python
-// version, so existing settings files keep working.
+// Inputs an output can take its audio from.
+const (
+	FromSRT    = "srt"    // the SRT input
+	FromDevice = "device" // the local input device (mic, line-in)
+)
+
+// Config holds every setting. The JSON layout extends the earlier Python
+// version's, so existing settings files keep working.
 type Config struct {
-	FFmpeg           string      `json:"ffmpeg"`
-	Source           string      `json:"source"` // "srt" | "device"
+	FFmpeg string `json:"ffmpeg"`
+	// Source is the pre-routing setting (one input feeding both outputs). It
+	// is only read to fill MonitorSource and SendSource, then dropped.
+	Source           string      `json:"source,omitempty"`
+	MonitorSource    string      `json:"monitor_source"` // FromSRT | FromDevice: what the monitor plays
+	SendSource       string      `json:"send_source"`    // FromSRT | FromDevice: what SRT out sends
 	SrtIn            SrtEndpoint `json:"srt_in"`
 	LowLatencyInput  bool        `json:"low_latency_input"`
 	HostAPI          string      `json:"host_api"`     // audio backend, "" = default for this OS
@@ -164,11 +174,13 @@ type Config struct {
 	SavePassphrases  bool        `json:"save_passphrases"`
 }
 
-// DefaultConfig returns the settings used when there is no settings file.
+// DefaultConfig returns the settings used when there is no settings file:
+// listen to the SRT input and send the local input (talkback).
 func DefaultConfig() Config {
 	return Config{
 		FFmpeg:           "ffmpeg",
-		Source:           "srt",
+		MonitorSource:    FromSRT,
+		SendSource:       FromDevice,
 		SrtIn:            SrtEndpoint{Mode: "listener", Port: 9000, LatencyMs: 120},
 		LowLatencyInput:  true,
 		MonitorEnabled:   true,
@@ -202,10 +214,35 @@ func LoadConfig(path string) (Config, error) {
 	if err != nil {
 		return cfg, err
 	}
+	cfg.MonitorSource, cfg.SendSource = "", ""         // so an older file's "source" can fill them
 	if err := json.Unmarshal(data, &cfg); err != nil { // missing keys keep their defaults
 		return DefaultConfig(), fmt.Errorf("%s: %w", path, err)
 	}
+	cfg.normalize()
 	return cfg, nil
+}
+
+// normalize fills the routing from an older file's single "source": both
+// outputs took their audio from it (for "srt", the relay setup).
+func (c *Config) normalize() {
+	legacy := c.Source
+	c.Source = ""
+	valid := func(s string) bool { return s == FromSRT || s == FromDevice }
+	if !valid(legacy) {
+		legacy = ""
+	}
+	if !valid(c.MonitorSource) {
+		c.MonitorSource = legacy
+		if legacy == "" {
+			c.MonitorSource = FromSRT
+		}
+	}
+	if !valid(c.SendSource) {
+		c.SendSource = legacy
+		if legacy == "" {
+			c.SendSource = FromDevice
+		}
+	}
 }
 
 // SaveConfig writes the settings with 0600 permissions, because the file can
