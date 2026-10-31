@@ -6,7 +6,7 @@ Context for working on this repo with Claude Code.
 
 SRT Audio Bridge, a cross-platform Go app with two inputs (SRT in, a local input device such as a mic) and two outputs (a monitor device, SRT out). Both inputs can run at once and each output picks one. The core requirement is talkback: hear the SRT programme feed on the monitor while the mic goes out over SRT, at the same time. Relaying SRT in to SRT out is also supported. Fyne GUI by default, `-headless` for unattended runs, `-list-devices` for diagnostics. Dependencies: Go stdlib + Fyne (GUI) + malgo/miniaudio (audio devices, compiled in) + an ffmpeg binary built with libsrt, run as a child process. Release builds embed that ffmpeg and unpack it when none is installed. Keep it dependency-light. It replaced an earlier single-file Python/tkinter version (in git history). Settings files from it still load: their single `source` becomes both `monitor_source` and `send_source`.
 
-Primary target: Windows amd64, cross-compiled in GitHub Actions (`.github/workflows/build.yml`). macOS comes later and needs a macOS runner (cgo + Apple SDK).
+Primary target: Windows amd64, cross-compiled in GitHub Actions (`.github/workflows/build.yml`). CI doesn't run on push: it builds when a release is published (from the release's tag; the version comes from the tag) and attaches `srt-audio-bridge-<tag>-windows-amd64.zip` to that release. Manual test builds: Actions → Build → Run workflow (artifact only). macOS comes later and needs a macOS runner (cgo + Apple SDK).
 
 ## Layout
 

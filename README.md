@@ -26,7 +26,7 @@ ffmpeg does the SRT, decoding and encoding. Audio devices go through [miniaudio]
 
 ## Get it (Windows)
 
-1. Download `srt-audio-bridge-windows-amd64` from the latest run under the repo's **Actions** tab, or a zip from **Releases** (published for `v*` tags).
+1. Download `srt-audio-bridge-<version>-windows-amd64.zip` from the repo's **Releases** page. Each release gets its build attached a few minutes after it is published.
 2. Run `srt-audio-bridge.exe`. It isn't signed yet, so SmartScreen asks first: **More info → Run anyway**.
 
 That's all: ffmpeg is built into the exe. ffmpeg is picked in this order:
@@ -94,7 +94,7 @@ You need Go 1.24+ and a C compiler, because miniaudio and the GUI toolkit ([Fyne
   CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=x86_64-w64-mingw32-gcc \
     go build -ldflags "-s -w -H=windowsgui" -o srt-audio-bridge.exe ./cmd/srt-audio-bridge
   ```
-  CI also embeds the icon, manifest and version info with [go-winres](https://github.com/tc-hib/go-winres), and the ffmpeg build: it puts `ffmpeg.gz`, `ffmpeg.sha256`, `LICENSE.txt` and `SOURCE.txt` into `internal/bridge/bundled/` and builds with `-tags bundleffmpeg`. Without that tag the program has no built-in ffmpeg and uses an installed one. See `.github/workflows/build.yml`.
+  CI (`.github/workflows/build.yml`) runs when a release is published, builds from the release's tag, and attaches the zip to the release. A test build without a release: **Actions → Build → Run workflow**, then download it from that run. CI also embeds the icon, manifest and version info with [go-winres](https://github.com/tc-hib/go-winres), and the ffmpeg build: it puts `ffmpeg.gz`, `ffmpeg.sha256`, `LICENSE.txt` and `SOURCE.txt` into `internal/bridge/bundled/` and builds with `-tags bundleffmpeg`. Without that tag the program has no built-in ffmpeg and uses an installed one. See `.github/workflows/build.yml`.
 - **Windows natively:** put a MinGW-w64 `gcc` (MSYS2 or WinLibs) on `PATH`, then `go build -ldflags -H=windowsgui ./cmd/srt-audio-bridge`.
 - **macOS (planned):** Xcode command line tools, then `go build ./cmd/srt-audio-bridge`.
 
