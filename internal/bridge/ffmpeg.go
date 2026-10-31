@@ -14,29 +14,36 @@ import (
 	"time"
 )
 
-// FindFFmpeg resolves the ffmpeg binary: an explicit file path first, then an
-// ffmpeg next to this program (handy for a bundled Windows build), then PATH.
+// FindFFmpeg resolves the ffmpeg binary without installing anything: an
+// explicit file path first; for the default "ffmpeg", one next to this
+// program, then PATH, then the bundled one if it was unpacked before. With a
+// bundle available, an ffmpeg on PATH without SRT support is skipped.
+// ResolveFFmpeg also installs the bundle when nothing is found.
 func FindFFmpeg(hint string) string {
 	hint = strings.TrimSpace(hint)
 	if hint == "" {
 		hint = "ffmpeg"
 	}
-	if st, err := os.Stat(hint); err == nil && !st.IsDir() && strings.ContainsAny(hint, `/\`) {
-		return hint
+	if strings.ContainsAny(hint, `/\`) {
+		if st, err := os.Stat(hint); err == nil && !st.IsDir() {
+			return hint
+		}
+		return ""
 	}
-	if hint == "ffmpeg" {
+	auto := hint == "ffmpeg"
+	if auto {
 		if exe, err := os.Executable(); err == nil {
-			local := filepath.Join(filepath.Dir(exe), "ffmpeg")
-			if runtime.GOOS == "windows" {
-				local += ".exe"
-			}
+			local := filepath.Join(filepath.Dir(exe), ffmpegExeName())
 			if st, err := os.Stat(local); err == nil && !st.IsDir() {
 				return local
 			}
 		}
 	}
-	if p, err := exec.LookPath(hint); err == nil {
+	if p, err := exec.LookPath(hint); err == nil && (!auto || !HasBundledFFmpeg() || hasSRT(p)) {
 		return p
+	}
+	if auto {
+		return installedBundle()
 	}
 	return ""
 }

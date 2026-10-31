@@ -359,7 +359,7 @@ func (u *ui) build() fyne.CanvasObject {
 
 	// settings
 	u.ffmpeg = widget.NewEntry()
-	u.ffmpeg.SetPlaceHolder("ffmpeg (from PATH or next to this program)")
+	u.ffmpeg.SetPlaceHolder("ffmpeg (next to this program, on PATH, or the bundled one)")
 	u.ffInfo = widget.NewLabel("")
 	u.savePass = widget.NewCheck("Save passphrases", nil)
 	settings := newPanel("Settings", nil, container.NewBorder(nil, nil, widget.NewLabel("ffmpeg"),
@@ -595,10 +595,23 @@ func (u *ui) checkFFmpeg() {
 	u.ffInfo.SetText("checking…")
 	go func() {
 		path := bridge.FindFFmpeg(hint)
+		if path == "" && bridge.HasBundledFFmpeg() {
+			setInfo("installing…", widget.MediumImportance)
+			var err error
+			if path, err = bridge.ResolveFFmpeg(hint, u.log); err != nil {
+				setInfo("install failed", widget.DangerImportance)
+				u.log(err.Error())
+				return
+			}
+		}
 		if path == "" {
 			setInfo("not found", widget.DangerImportance)
 			u.log("ffmpeg not found. Install it, put it next to this program, or set its path.")
 			return
+		}
+		origin := ""
+		if bridge.IsBundledFFmpeg(path) {
+			origin = " · bundled"
 		}
 		info, err := bridge.ProbeFFmpeg(path)
 		if err != nil {
@@ -611,9 +624,9 @@ func (u *ui) checkFFmpeg() {
 			version = version[:18]
 		}
 		if info.SRT {
-			setInfo(version+" · SRT OK", widget.SuccessImportance)
+			setInfo(version+" · SRT OK"+origin, widget.SuccessImportance)
 		} else {
-			setInfo(version+" · no SRT", widget.DangerImportance)
+			setInfo(version+" · no SRT"+origin, widget.DangerImportance)
 			u.log("This ffmpeg build has no SRT support. Use a build with libsrt " +
 				"(gyan.dev or BtbN on Windows, Homebrew on macOS, distro ffmpeg on most Linux).")
 		}

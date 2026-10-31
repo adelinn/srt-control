@@ -17,13 +17,18 @@ ffmpeg does the SRT, decoding and encoding. Audio devices go through [miniaudio]
 ## Get it (Windows)
 
 1. Download `srt-audio-bridge-windows-amd64` from the latest run under the repo's **Actions** tab, or a zip from **Releases** (published for `v*` tags).
-2. Get an ffmpeg build with SRT, such as the gyan.dev or BtbN builds, and either put `ffmpeg.exe` next to the app, have it on `PATH`, or pick it with **Browse…**. **Check** shows `SRT OK` when it is usable.
-3. Run `srt-audio-bridge.exe`. The exe isn't signed yet, so SmartScreen asks first: **More info → Run anyway**.
+2. Run `srt-audio-bridge.exe`. It isn't signed yet, so SmartScreen asks first: **More info → Run anyway**.
 
-The download has two exes built from the same code:
+That's all: ffmpeg is built into the exe. ffmpeg is picked in this order:
 
-- `srt-audio-bridge.exe`: the GUI, without a console window.
-- `srt-audio-bridge.console.exe`: the same program as a console app. Use it for the command-line options below, or to see the log in a terminal.
+1. The file set under **Settings**, if it's a path.
+2. `ffmpeg.exe` next to the app.
+3. An ffmpeg on `PATH`, if it supports SRT.
+4. The built-in copy. The first time it's needed, the app unpacks it to `%LOCALAPPDATA%\SRT Audio Bridge\ffmpeg\`; no admin rights or internet needed. A new release replaces the old copy.
+
+**Check** shows which one is used (`SRT OK · bundled` for the built-in one).
+
+The built-in ffmpeg is an LGPL build from [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds) with SRT, AAC, MP2 and Opus. Its license and a note on its source come with the download (`ffmpeg-LICENSE.txt`, `ffmpeg-SOURCE.txt`) and are unpacked next to it.
 
 ## Run
 
@@ -34,6 +39,8 @@ srt-audio-bridge -headless              # run the last saved settings, no GUI
 srt-audio-bridge -config venue-a.json   # use another settings file (presets)
 srt-audio-bridge -version
 ```
+
+On Windows the exe prints to the terminal it was started from, but cmd and PowerShell don't wait for it (it is a GUI program). When that matters, use `start /wait srt-audio-bridge.exe -list-devices` or `Start-Process -Wait -NoNewWindow srt-audio-bridge.exe -ArgumentList -headless`. Task Scheduler and service wrappers can run `-headless` directly.
 
 Settings are saved to `~/.srt_audio_bridge.json` when you press Start and when you close the window. It is the same file and format the earlier Python version used, so existing settings carry over. Passphrases are only saved when "Save passphrases" is ticked.
 
@@ -48,7 +55,7 @@ Settings are saved to `~/.srt_audio_bridge.json` when you press Start and when y
 
 ## Platform notes
 
-- **Windows:** WASAPI is picked by default, and miniaudio resamples devices that aren't set to 48 kHz. Picking ffmpeg and error messages use the native Windows dialogs. The GUI needs OpenGL 2.1, which any GPU driver provides; a VM or remote session without GPU acceleration may not.
+- **Windows:** WASAPI is picked by default, and miniaudio resamples devices that aren't set to 48 kHz. Picking ffmpeg and error messages use the native Windows dialogs. The GUI needs OpenGL 2.1, which any GPU driver provides; a VM or remote session without GPU acceleration may not. If company policy blocks programs in `%LOCALAPPDATA%`, the built-in ffmpeg can't run from there; put `ffmpeg.exe` next to the app instead.
 - **macOS (planned):** the first time you use a local input, allow microphone access.
 - **Security:** passphrases are masked in the log, and the settings file is created with 0600 permissions. ffmpeg still receives them on its command line, so other local users can see them in the process list.
 
@@ -67,7 +74,7 @@ You need Go 1.24+ and a C compiler, because miniaudio and the GUI toolkit ([Fyne
   CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=x86_64-w64-mingw32-gcc \
     go build -ldflags "-s -w -H=windowsgui" -o srt-audio-bridge.exe ./cmd/srt-audio-bridge
   ```
-  CI also embeds the icon, manifest and version info with [go-winres](https://github.com/tc-hib/go-winres); see `.github/workflows/build.yml`.
+  CI also embeds the icon, manifest and version info with [go-winres](https://github.com/tc-hib/go-winres), and the ffmpeg build: it puts `ffmpeg.gz`, `ffmpeg.sha256`, `LICENSE.txt` and `SOURCE.txt` into `internal/bridge/bundled/` and builds with `-tags bundleffmpeg`. Without that tag the program has no built-in ffmpeg and uses an installed one. See `.github/workflows/build.yml`.
 - **Windows natively:** put a MinGW-w64 `gcc` (MSYS2 or WinLibs) on `PATH`, then `go build -ldflags -H=windowsgui ./cmd/srt-audio-bridge`.
 - **macOS (planned):** Xcode command line tools, then `go build ./cmd/srt-audio-bridge`.
 

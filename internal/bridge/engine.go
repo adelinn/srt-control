@@ -52,8 +52,9 @@ func (e *Engine) Start() error {
 	cfg := e.cfg
 	ffmpeg := ""
 	if cfg.Source == "srt" || cfg.SendEnabled {
-		if ffmpeg = FindFFmpeg(cfg.FFmpeg); ffmpeg == "" {
-			return errors.New("ffmpeg not found. Install it or set its path.")
+		var err error
+		if ffmpeg, err = ResolveFFmpeg(cfg.FFmpeg, e.log); err != nil {
+			return err
 		}
 	}
 	if cfg.Source != "srt" && cfg.Source != "device" {

@@ -3,6 +3,7 @@ dist/
 *.exe
 *.syso
 /srt-audio-bridge
+internal/bridge/bundled/
 
 # local test files
 *.raw

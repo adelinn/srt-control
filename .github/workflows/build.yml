@@ -54,6 +54,40 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64
+      - name: Fetch ffmpeg to bundle (LGPL build with libsrt)
+        # The newest release-branch build from BtbN/FFmpeg-Builds, checked
+        # against its published checksums. LGPL (not GPL) keeps the
+        # redistribution terms light; it still has SRT, AAC, MP2 and Opus.
+        run: |
+          base=https://github.com/BtbN/FFmpeg-Builds/releases/download/latest
+          curl -fsSL --retry 3 -o checksums.sha256 "$base/checksums.sha256"
+          asset=$(grep -oE 'ffmpeg-n[0-9.]+-latest-win64-lgpl-[0-9.]+\.zip' checksums.sha256 | sort -uV | tail -1)
+          [ -n "$asset" ] || { echo "::error::no win64 LGPL release build listed"; exit 1; }
+          echo "Bundling $asset"
+          curl -fsSL --retry 3 -o ffmpeg.zip "$base/$asset"
+          grep " \*\?$asset\$" checksums.sha256 | sed "s| \*\?$asset\$| ffmpeg.zip|" | sha256sum -c -
+          exe=$(unzip -Z1 ffmpeg.zip | grep -E '/bin/ffmpeg\.exe$')
+          license=$(unzip -Z1 ffmpeg.zip | grep -iE '^[^/]+/LICENSE[^/]*$' | head -1)
+          [ -n "$license" ] || { echo "::error::no license file in $asset"; exit 1; }
+          unzip -q -j ffmpeg.zip "$exe" "$license" -d ffmpeg-dl
+          for feature in libsrt libopus; do
+            grep -aq -- "--enable-$feature" ffmpeg-dl/ffmpeg.exe || { echo "::error::bundled ffmpeg lacks $feature"; exit 1; }
+          done
+          b=internal/bridge/bundled
+          mkdir -p "$b"
+          gzip -9c ffmpeg-dl/ffmpeg.exe > "$b/ffmpeg.gz"
+          sha256sum ffmpeg-dl/ffmpeg.exe | cut -d' ' -f1 > "$b/ffmpeg.sha256"
+          cp "ffmpeg-dl/$(basename "$license")" "$b/LICENSE.txt"
+          {
+            echo "${asset%.zip} (BtbN FFmpeg-Builds, LGPL)"
+            echo
+            echo "Downloaded $(date -u +%F) from $base/$asset"
+            echo "zip sha256: $(sha256sum ffmpeg.zip | cut -d' ' -f1)"
+            echo "FFmpeg is licensed under the GNU LGPL 2.1 or later; see LICENSE.txt."
+            echo "Source code: https://ffmpeg.org/download.html (the version string names the exact commit)"
+            echo "Build scripts: https://github.com/BtbN/FFmpeg-Builds"
+          } > "$b/SOURCE.txt"
+          ls -la "$b"
       - name: Version
         id: version
         run: |
@@ -77,13 +111,16 @@ jobs:
           GOARCH: amd64
           CC: x86_64-w64-mingw32-gcc
         run: |
-          flags="-s -w -X main.version=${{ steps.version.outputs.version }}"
-          # GUI build (no console window) and the same program as a console app
-          # for -headless, -list-devices and seeing the log in a terminal.
-          go build -trimpath -ldflags "$flags -H=windowsgui" -o dist/srt-audio-bridge.exe ./cmd/srt-audio-bridge
-          go build -trimpath -ldflags "$flags" -o dist/srt-audio-bridge.console.exe ./cmd/srt-audio-bridge
+          # One exe: GUI subsystem (no console window), ffmpeg embedded. With
+          # command-line options it attaches to the terminal it was started from.
+          go build -trimpath -tags bundleffmpeg \
+            -ldflags "-s -w -H=windowsgui -X main.version=${{ steps.version.outputs.version }}" \
+            -o dist/srt-audio-bridge.exe ./cmd/srt-audio-bridge
           cp README.md dist/
-      - name: Check the exes only need system DLLs
+          cp internal/bridge/bundled/LICENSE.txt dist/ffmpeg-LICENSE.txt
+          cp internal/bridge/bundled/SOURCE.txt dist/ffmpeg-SOURCE.txt
+          ls -la dist
+      - name: Check the exe only needs system DLLs
         run: |
           for f in dist/*.exe; do
             dlls=$(x86_64-w64-mingw32-objdump -p "$f" | awk '/DLL Name/{print $3}')
@@ -109,7 +146,9 @@ jobs:
   #     - uses: actions/setup-go@v5
   #       with:
   #         go-version-file: go.mod
-  #     - run: go build -trimpath -ldflags "-s -w" -o dist/srt-audio-bridge ./cmd/srt-audio-bridge
+  #     # fetch a macOS ffmpeg with libsrt into internal/bridge/bundled/ like
+  #     # the Windows job does, then:
+  #     - run: go build -trimpath -tags bundleffmpeg -ldflags "-s -w" -o dist/srt-audio-bridge ./cmd/srt-audio-bridge
   #     # then a .app bundle (fyne package -os darwin), signing and notarization
   #     - uses: actions/upload-artifact@v4
   #       with:

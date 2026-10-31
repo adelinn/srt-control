@@ -26,6 +26,9 @@ import (
 var version = "dev"
 
 func main() {
+	if len(os.Args) > 1 {
+		attachConsole()
+	}
 	configPath := flag.String("config", bridge.DefaultConfigPath(), "settings file")
 	headless := flag.Bool("headless", false, "run the saved settings without a GUI")
 	listDevices := flag.Bool("list-devices", false, "print audio devices and exit")
