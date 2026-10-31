@@ -172,8 +172,12 @@ func (e *Engine) checkSrtIn() error {
 	if err := e.cfg.SrtIn.Validate(); err != nil {
 		return fmt.Errorf("SRT in: %w", err)
 	}
-	if e.cfg.SendEnabled && e.cfg.SrtIn.Mode == "listener" && e.cfg.SrtOut.Mode == "listener" &&
-		e.cfg.SrtIn.Port == e.cfg.SrtOut.Port {
+	if !e.cfg.SendEnabled {
+		return nil
+	}
+	inMode, _, inPort, _ := e.cfg.SrtIn.Target()
+	outMode, _, outPort, err := e.cfg.SrtOut.Target()
+	if err == nil && inMode == "listener" && outMode == "listener" && inPort == outPort {
 		return errors.New("SRT in and SRT out can't both listen on the same port")
 	}
 	return nil

@@ -38,7 +38,7 @@ const (
 )
 
 var (
-	latencyChoices = []string{"20", "50", "80", "120", "200", "300", "500", "1000", "2000"}
+	latencyChoices = []string{"20", "30", "40", "60", "80", "120", "200", "300", "500", "1000", "2000"}
 	bufferChoices  = []string{"20", "40", "60", "80", "100", "150", "200", "300", "500", "1000"}
 	// what the monitor plays and SRT out sends
 	routeLabels = []string{"SRT input", "Local input"}
@@ -61,7 +61,8 @@ func setRoute(r *widget.RadioGroup, key string) {
 }
 
 // srtForm is the set of fields for one SRT endpoint, with a hint and a
-// preview of the URL ffmpeg will get (passphrase masked).
+// preview of the URL ffmpeg will get (passphrase masked). "Edit URL" turns
+// the preview into an editable URL that is used exactly as typed.
 type srtForm struct {
 	mode     *widget.Select
 	host     *widget.Entry
@@ -71,6 +72,9 @@ type srtForm struct {
 	streamID *widget.Entry
 	hint     *mutedText
 	url      *widget.Label
+	custom   *widget.Entry
+	edit     *widget.Check
+	enabled  bool
 	box      fyne.CanvasObject
 }
 
@@ -84,11 +88,17 @@ func newSrtForm() *srtForm {
 		streamID: widget.NewEntry(),
 		hint:     newMutedText("", false),
 		url:      widget.NewLabel(""),
+		custom:   widget.NewEntry(),
+		enabled:  true,
 	}
 	f.url.SizeName = theme.SizeNameCaptionText
 	f.url.TextStyle = fyne.TextStyle{Monospace: true}
 	f.url.Truncation = fyne.TextTruncateEllipsis
 	f.url.Selectable = true
+	f.custom.TextStyle = fyne.TextStyle{Monospace: true}
+	f.custom.SetPlaceHolder("srt://host:port?mode=caller&transtype=live&latency=120000")
+	f.custom.Hide()
+	f.edit = widget.NewCheck("Edit URL", f.toggleEdit)
 
 	left := container.New(layout.NewFormLayout(),
 		widget.NewLabel("Mode"), f.mode,
@@ -98,7 +108,8 @@ func newSrtForm() *srtForm {
 		widget.NewLabel("Latency"), container.NewBorder(nil, nil, nil, widget.NewLabel("ms"), withWidth(f.latency, 82)),
 		widget.NewLabel("Port"), withWidth(f.port, 82),
 		widget.NewLabel("Stream ID"), withWidth(f.streamID, 82))
-	f.box = container.NewVBox(container.NewBorder(nil, nil, nil, right, left), f.hint, f.url)
+	urlRow := container.NewBorder(nil, nil, nil, f.edit, container.NewStack(f.url, f.custom))
+	f.box = container.NewVBox(container.NewBorder(nil, nil, nil, right, left), f.hint, urlRow)
 
 	changed := func(string) { f.updatePreview() }
 	f.mode.OnChanged = changed
@@ -107,17 +118,19 @@ func newSrtForm() *srtForm {
 	f.latency.OnChanged = changed
 	f.pass.OnChanged = changed
 	f.streamID.OnChanged = changed
+	f.custom.OnChanged = changed
 	return f
 }
 
 func (f *srtForm) endpoint() (bridge.SrtEndpoint, error) {
+	custom := f.edit.Checked
 	num := func(name, s string) (int, error) {
 		s = strings.TrimSpace(s)
 		if s == "" {
 			return 0, nil
 		}
 		v, err := strconv.Atoi(s)
-		if err != nil {
+		if err != nil && !custom { // the fields don't matter while the URL is edited
 			return 0, fmt.Errorf("%s must be a number", name)
 		}
 		return v, nil
@@ -133,6 +146,7 @@ func (f *srtForm) endpoint() (bridge.SrtEndpoint, error) {
 	return bridge.SrtEndpoint{
 		Mode: f.mode.Selected, Host: strings.TrimSpace(f.host.Text), Port: port, LatencyMs: latency,
 		Passphrase: f.pass.Text, StreamID: strings.TrimSpace(f.streamID.Text),
+		UseCustomURL: custom, CustomURL: strings.TrimSpace(f.custom.Text),
 	}, nil
 }
 
@@ -143,11 +157,26 @@ func (f *srtForm) set(ep bridge.SrtEndpoint) {
 	f.latency.SetText(strconv.Itoa(ep.LatencyMs))
 	f.pass.SetText(ep.Passphrase)
 	f.streamID.SetText(ep.StreamID)
+	f.custom.SetText(ep.CustomURL)
+	f.edit.SetChecked(ep.UseCustomURL)
+	f.applyEnabled()
+	f.updatePreview()
+}
+
+// toggleEdit starts the editable URL from the one the fields give.
+func (f *srtForm) toggleEdit(on bool) {
+	if on && strings.TrimSpace(f.custom.Text) == "" {
+		f.edit.Checked = false
+		if ep, err := f.endpoint(); err == nil {
+			f.custom.SetText(ep.URL(nil, false))
+		}
+		f.edit.Checked = true
+	}
+	f.applyEnabled()
 	f.updatePreview()
 }
 
 func (f *srtForm) updatePreview() {
-	f.hint.SetText(bridge.ModeHints[f.mode.Selected])
 	if f.mode.Selected == "listener" {
 		f.host.SetPlaceHolder("blank = all interfaces")
 	} else {
@@ -157,6 +186,19 @@ func (f *srtForm) updatePreview() {
 	if err == nil {
 		err = ep.Validate()
 	}
+	if f.edit.Checked {
+		if err != nil {
+			f.hint.setWarning(true)
+			f.hint.SetText("Not valid yet: " + err.Error())
+		} else {
+			mode, _, _, _ := ep.Target()
+			f.hint.setWarning(false)
+			f.hint.SetText("Used exactly as typed (" + mode + " mode). The fields above are ignored.")
+		}
+		return
+	}
+	f.hint.setWarning(false)
+	f.hint.SetText(bridge.ModeHints[f.mode.Selected])
 	if err != nil {
 		f.url.Importance = widget.WarningImportance
 		f.url.SetText("Not valid yet: " + err.Error())
@@ -167,9 +209,26 @@ func (f *srtForm) updatePreview() {
 }
 
 func (f *srtForm) setEnabled(on bool) {
-	for _, w := range []fyne.Disableable{f.mode, f.host, f.port, f.latency, f.pass, f.streamID} {
-		enable(w, on)
+	f.enabled = on
+	f.applyEnabled()
+}
+
+// applyEnabled greys out the fields while the URL is edited by hand, and
+// everything while the form as a whole is off.
+func (f *srtForm) applyEnabled() {
+	custom := f.edit.Checked
+	if custom {
+		f.url.Hide()
+		f.custom.Show()
+	} else {
+		f.custom.Hide()
+		f.url.Show()
 	}
+	for _, w := range []fyne.Disableable{f.mode, f.host, f.port, f.latency, f.pass, f.streamID} {
+		enable(w, f.enabled && !custom)
+	}
+	enable(f.edit, f.enabled)
+	enable(f.custom, f.enabled)
 }
 
 func enable(w fyne.Disableable, on bool) {
@@ -202,6 +261,7 @@ type ui struct {
 	api               *widget.Select
 	in, out           *srtForm
 	lowLatency        *widget.Check
+	rawLatency        *widget.Check
 	inDevice          *widget.Select
 	send              *widget.Check
 	sendFrom          *widget.RadioGroup
@@ -332,10 +392,12 @@ func (u *ui) build() fyne.CanvasObject {
 	// Inputs on the left, outputs on the right; each output picks its input.
 	// SRT input
 	u.in = newSrtForm()
-	u.lowLatency = widget.NewCheck("Low-latency start (smaller probe)", nil)
+	u.lowLatency = widget.NewCheck("Low-latency start", nil)
+	u.rawLatency = widget.NewCheck("Raw low latency (probesize 32)", func(bool) { u.updateEnabled() })
 	u.meterSRT = newLevelMeter()
 	u.lightSRT = newStatusLight()
-	srtIn := newPanel("SRT input", u.lightSRT, nil, container.NewVBox(u.in.box, u.lowLatency, u.meterSRT))
+	srtIn := newPanel("SRT input", u.lightSRT, nil, container.NewVBox(u.in.box,
+		container.NewHBox(u.lowLatency, u.rawLatency), u.meterSRT))
 
 	// local input
 	u.inDevice = widget.NewSelect(nil, nil)
@@ -432,6 +494,7 @@ func (u *ui) fill() {
 	u.in.set(c.SrtIn)
 	u.out.set(c.SrtOut)
 	u.lowLatency.SetChecked(c.LowLatencyInput)
+	u.rawLatency.SetChecked(c.RawLowLatency)
 	u.send.SetChecked(c.SendEnabled)
 	u.codec.SetSelected("AAC")
 	u.codec.SetSelected(c.Codec) // ignored if unknown
@@ -485,6 +548,7 @@ func (u *ui) collect() (bridge.Config, error) {
 		SendSource:       routeKey(u.sendFrom),
 		SrtIn:            in,
 		LowLatencyInput:  u.lowLatency.Checked,
+		RawLowLatency:    u.rawLatency.Checked,
 		HostAPI:          u.api.Selected,
 		InputDevice:      deviceValue(u.inDevice.Selected),
 		MonitorEnabled:   u.monitor.Checked,
@@ -511,6 +575,7 @@ func deviceValue(label string) string {
 // updateEnabled greys out the SRT output settings while sending is off. Both
 // inputs stay editable: either can be routed to an output at any time.
 func (u *ui) updateEnabled() {
+	enable(u.lowLatency, !u.rawLatency.Checked) // raw includes everything low-latency start does
 	send := u.send.Checked
 	u.out.setEnabled(send)
 	enable(u.sendFrom, send)

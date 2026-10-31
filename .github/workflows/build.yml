@@ -1,9 +1,11 @@
 name: Build
 
+# Builds when a release is published (creating a release, or publishing a
+# draft) and attaches the zip to it. "Run workflow" in the Actions tab makes a
+# test build, downloadable from that run only.
 on:
-  push:
-    branches: ["**"]
-    tags: ["v*"]
+  release:
+    types: [published]
   workflow_dispatch:
 
 permissions:
@@ -95,8 +97,9 @@ jobs:
       - name: Version
         id: version
         run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then v="$GITHUB_REF_NAME"; else v="dev-${GITHUB_SHA::7}"; fi
-          n=$(echo "$v" | grep -oE '^v[0-9]+\.[0-9]+\.[0-9]+' | tr -d v || true)
+          # a release builds its tag (v1.2.3 or 1.2.3); a manual run is dev-<commit>
+          if [[ "$GITHUB_EVENT_NAME" == release ]]; then v="$GITHUB_REF_NAME"; else v="dev-${GITHUB_SHA::7}"; fi
+          n=$(echo "$v" | grep -oE '^v?[0-9]+\.[0-9]+\.[0-9]+' | tr -d v || true)
           echo "version=$v" >> "$GITHUB_OUTPUT"
           echo "numeric=${n:-0.0.0}.0" >> "$GITHUB_OUTPUT"
       - name: Windows resources (icon, manifest, version info)
@@ -160,8 +163,8 @@ jobs:
   #         path: dist/
 
   release:
-    name: Release
-    if: startsWith(github.ref, 'refs/tags/v')
+    name: Attach to the release
+    if: github.event_name == 'release'
     needs: [windows]
     runs-on: ubuntu-24.04
     permissions:
@@ -171,10 +174,11 @@ jobs:
         with:
           name: srt-audio-bridge-windows-amd64
           path: srt-audio-bridge-windows-amd64
-      - name: Publish the release
+      - name: Upload the zip to the release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
         run: |
-          zip -r "srt-audio-bridge-$GITHUB_REF_NAME-windows-amd64.zip" srt-audio-bridge-windows-amd64
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes \
-            "srt-audio-bridge-$GITHUB_REF_NAME-windows-amd64.zip"
+          zip -r "srt-audio-bridge-$TAG-windows-amd64.zip" srt-audio-bridge-windows-amd64
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+            "srt-audio-bridge-$TAG-windows-amd64.zip"

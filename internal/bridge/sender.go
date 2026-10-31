@@ -36,10 +36,18 @@ func (s *srtSender) command() []string {
 		"-probesize", "32", "-analyzeduration", "0",
 		"-f", "s16le", "-ar", fmt.Sprint(Rate), "-ac", fmt.Sprint(Channels), "-i", "pipe:0"}
 	cmd = append(cmd, codecArgs[s.cfg.Codec]...)
+	if s.cfg.Codec == "Opus" {
+		// 10 ms frames instead of 20, and no look-ahead for speech/music analysis
+		cmd = append(cmd, "-application", "lowdelay", "-frame_duration", "10")
+	}
 	if !IsLossless(s.cfg.Codec) {
 		cmd = append(cmd, "-b:a", fmt.Sprintf("%dk", s.cfg.BitrateK))
 	}
-	return append(cmd, "-f", "mpegts", "-flush_packets", "1", "-muxdelay", "0", s.cfg.SrtOut.URL(nil, false))
+	return append(cmd, "-f", "mpegts", "-flush_packets", "1", "-muxdelay", "0", "-muxpreload", "0",
+		// one PES packet per audio frame: by default the muxer gathers ~2.9 kB
+		// first, which is ~120 ms of audio at 192 kbit/s
+		"-pes_payload_size", "0",
+		s.cfg.SrtOut.URL(nil, false))
 }
 
 func (s *srtSender) start() { go s.run() }
@@ -137,7 +145,7 @@ func (s *srtSender) waitUntilOpen(p *ffproc, flowing chan struct{}) bool {
 			return false
 		case <-tick.C:
 			// very old ffmpeg builds only report once fed; a caller connects fast anyway
-			if s.cfg.SrtOut.Mode != "listener" && time.Since(t0) > 3*time.Second {
+			if mode, _, _, _ := s.cfg.SrtOut.Target(); mode != "listener" && time.Since(t0) > 3*time.Second {
 				return true
 			}
 		}
@@ -178,7 +186,7 @@ func (s *srtSender) pump(p *ffproc) {
 
 func (s *srtSender) run() {
 	defer close(s.ctl.done)
-	ep := s.cfg.SrtOut
+	mode, host, port, _ := s.cfg.SrtOut.Target() // validated before start
 	backoff := time.Second
 	first := true
 	for !s.ctl.stopped() {
@@ -187,10 +195,10 @@ func (s *srtSender) run() {
 		s.mu.Lock()
 		s.bitrate = ""
 		s.mu.Unlock()
-		if ep.Mode == "listener" {
+		if mode == "listener" {
 			s.set("connecting", "waiting for a receiver")
 		} else {
-			s.set("connecting", fmt.Sprintf("connecting to %s:%d", ep.Host, ep.Port))
+			s.set("connecting", fmt.Sprintf("connecting to %s:%d", host, port))
 		}
 		args := s.command()
 		if first {
@@ -226,7 +234,7 @@ func (s *srtSender) run() {
 		}
 		s.set("reconnecting", fmt.Sprintf("retry in %.0f s", backoff.Seconds()))
 		s.ctl.sleep(backoff)
-		if ep.Mode == "listener" {
+		if mode == "listener" {
 			backoff = time.Second
 		} else {
 			backoff = min(backoff*2, 8*time.Second)

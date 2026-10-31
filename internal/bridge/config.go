@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -71,10 +72,18 @@ type SrtEndpoint struct {
 	LatencyMs  int    `json:"latency_ms"`
 	Passphrase string `json:"passphrase"`
 	StreamID   string `json:"streamid"`
+	// Advanced: use CustomURL exactly as typed instead of building the URL
+	// from the fields above.
+	UseCustomURL bool   `json:"use_custom_url"`
+	CustomURL    string `json:"custom_url"`
 }
 
 // Validate checks the endpoint before ffmpeg gets it.
 func (e SrtEndpoint) Validate() error {
+	if e.UseCustomURL {
+		_, _, _, err := e.Target()
+		return err
+	}
 	known := false
 	for _, m := range SRTModes {
 		known = known || m == e.Mode
@@ -96,7 +105,17 @@ func (e SrtEndpoint) Validate() error {
 
 // URL builds the ffmpeg srt:// URL. extra holds additional key/value pairs;
 // mask replaces the passphrase with ****.
+//
+// A custom URL (UseCustomURL) is returned exactly as typed: extra is not
+// added, so whatever ffmpeg should get must be in it.
 func (e SrtEndpoint) URL(extra [][2]string, mask bool) string {
+	if e.UseCustomURL {
+		u := strings.TrimSpace(e.CustomURL)
+		if mask {
+			u = MaskSecrets(u)
+		}
+		return u
+	}
 	host := strings.TrimSpace(e.Host)
 	if host == "" {
 		host = "0.0.0.0"
@@ -106,6 +125,7 @@ func (e SrtEndpoint) URL(extra [][2]string, mask bool) string {
 	}
 	params := [][2]string{
 		{"mode", e.Mode},
+		{"transtype", "live"},                         // libsrt's default too; explicit for the reader
 		{"latency", strconv.Itoa(e.LatencyMs * 1000)}, // ffmpeg wants microseconds
 		{"pkt_size", "1316"},                          // 7 x 188-byte TS packets
 	}
@@ -125,6 +145,65 @@ func (e SrtEndpoint) URL(extra [][2]string, mask bool) string {
 		q[i] = kv[0] + "=" + escape(kv[1])
 	}
 	return fmt.Sprintf("srt://%s:%d?%s", host, e.Port, strings.Join(q, "&"))
+}
+
+// Target returns the mode, host and port the endpoint connects to or listens
+// on, read from the custom URL when one is used. A missing mode is libsrt's
+// default, caller; a blank host means all interfaces.
+func (e SrtEndpoint) Target() (mode, host string, port int, err error) {
+	if !e.UseCustomURL {
+		host = strings.TrimSpace(e.Host)
+		if host == "" {
+			host = "0.0.0.0"
+		}
+		return e.Mode, host, e.Port, nil
+	}
+	raw := strings.TrimSpace(e.CustomURL)
+	u, perr := url.Parse(raw)
+	if perr != nil || u.Scheme != "srt" {
+		return "", "", 0, errors.New("custom URL must look like srt://host:port?...")
+	}
+	port, perr = strconv.Atoi(u.Port())
+	if perr != nil || port < 1 || port > 65535 {
+		return "", "", 0, errors.New("custom URL needs a port 1-65535 (srt://host:port)")
+	}
+	mode = u.Query().Get("mode")
+	if mode == "" {
+		mode = "caller"
+	}
+	known := false
+	for _, m := range SRTModes {
+		known = known || m == mode
+	}
+	if !known {
+		return "", "", 0, fmt.Errorf("custom URL has unknown mode '%s'", mode)
+	}
+	host = u.Hostname()
+	if host == "" {
+		if mode != "listener" {
+			return "", "", 0, fmt.Errorf("custom URL needs a host in %s mode", mode)
+		}
+		host = "0.0.0.0"
+	}
+	return mode, host, port, nil
+}
+
+// stripPassphrase removes the passphrase parameter from an SRT URL.
+func stripPassphrase(u string) string {
+	base, query, ok := strings.Cut(u, "?")
+	if !ok {
+		return u
+	}
+	var keep []string
+	for _, kv := range strings.Split(query, "&") {
+		if !strings.HasPrefix(kv, "passphrase=") {
+			keep = append(keep, kv)
+		}
+	}
+	if len(keep) == 0 {
+		return base
+	}
+	return base + "?" + strings.Join(keep, "&")
 }
 
 // escape percent-encodes everything except RFC 3986 unreserved characters.
@@ -159,8 +238,9 @@ type Config struct {
 	SendSource       string      `json:"send_source"`    // FromSRT | FromDevice: what SRT out sends
 	SrtIn            SrtEndpoint `json:"srt_in"`
 	LowLatencyInput  bool        `json:"low_latency_input"`
-	HostAPI          string      `json:"host_api"`     // audio backend, "" = default for this OS
-	InputDevice      string      `json:"input_device"` // "" = system default
+	RawLowLatency    bool        `json:"raw_low_latency_input"` // probesize 32: fastest start, overrides LowLatencyInput
+	HostAPI          string      `json:"host_api"`              // audio backend, "" = default for this OS
+	InputDevice      string      `json:"input_device"`          // "" = system default
 	MonitorEnabled   bool        `json:"monitor_enabled"`
 	MonitorDevice    string      `json:"monitor_device"` // "" = system default
 	MonitorVolume    float64     `json:"monitor_volume"`
@@ -250,6 +330,8 @@ func (c *Config) normalize() {
 func SaveConfig(cfg Config, path string) error {
 	if !cfg.SavePassphrases {
 		cfg.SrtIn.Passphrase, cfg.SrtOut.Passphrase = "", ""
+		cfg.SrtIn.CustomURL = stripPassphrase(cfg.SrtIn.CustomURL)
+		cfg.SrtOut.CustomURL = stripPassphrase(cfg.SrtOut.CustomURL)
 	}
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {

@@ -16,21 +16,104 @@ func TestURL(t *testing.T) {
 		want  string
 	}{
 		{SrtEndpoint{Mode: "listener", Port: 9000, LatencyMs: 120}, nil, false,
-			"srt://0.0.0.0:9000?mode=listener&latency=120000&pkt_size=1316"},
+			"srt://0.0.0.0:9000?mode=listener&transtype=live&latency=120000&pkt_size=1316"},
 		{SrtEndpoint{Mode: "listener", Port: 9000, LatencyMs: 120}, [][2]string{{"timeout", "5000000"}}, false,
-			"srt://0.0.0.0:9000?mode=listener&latency=120000&pkt_size=1316&timeout=5000000"},
+			"srt://0.0.0.0:9000?mode=listener&transtype=live&latency=120000&pkt_size=1316&timeout=5000000"},
 		{SrtEndpoint{Mode: "caller", Host: " 10.0.0.5 ", Port: 9001, LatencyMs: 200, StreamID: "live/program",
 			Passphrase: "secret pass&word"}, nil, false,
-			"srt://10.0.0.5:9001?mode=caller&latency=200000&pkt_size=1316&streamid=live%2Fprogram&passphrase=secret%20pass%26word"},
+			"srt://10.0.0.5:9001?mode=caller&transtype=live&latency=200000&pkt_size=1316&streamid=live%2Fprogram&passphrase=secret%20pass%26word"},
 		{SrtEndpoint{Mode: "caller", Host: "h", Port: 1, Passphrase: "0123456789"}, nil, true,
-			"srt://h:1?mode=caller&latency=0&pkt_size=1316&passphrase=%2A%2A%2A%2A"},
+			"srt://h:1?mode=caller&transtype=live&latency=0&pkt_size=1316&passphrase=%2A%2A%2A%2A"},
 		{SrtEndpoint{Mode: "caller", Host: "::1", Port: 9001}, nil, false,
-			"srt://[::1]:9001?mode=caller&latency=0&pkt_size=1316"},
+			"srt://[::1]:9001?mode=caller&transtype=live&latency=0&pkt_size=1316"},
 	}
 	for _, c := range cases {
 		if got := c.ep.URL(c.extra, c.mask); got != c.want {
 			t.Errorf("URL(%+v)\n got %s\nwant %s", c.ep, got, c.want)
 		}
+	}
+}
+
+// Advanced: a custom URL goes to ffmpeg exactly as typed; mode, host and port
+// are read from it for status lines, reconnect timing and port checks.
+func TestCustomURL(t *testing.T) {
+	ep := SrtEndpoint{Mode: "caller", Host: "ignored", Port: 1, UseCustomURL: true,
+		CustomURL: " srt://:9100?mode=listener&latency=20000&passphrase=0123456789&rcvbuf=1000000 "}
+	if err := ep.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if mode, host, port, _ := ep.Target(); mode != "listener" || host != "0.0.0.0" || port != 9100 {
+		t.Errorf("target %s %s %d", mode, host, port)
+	}
+	if got := ep.URL([][2]string{{"timeout", "5"}}, false); got != strings.TrimSpace(ep.CustomURL) {
+		t.Errorf("custom URL changed: %s", got)
+	}
+	if got := ep.URL(nil, true); strings.Contains(got, "0123456789") {
+		t.Errorf("passphrase not masked: %s", got)
+	}
+	noMode := SrtEndpoint{UseCustomURL: true, CustomURL: "srt://10.1.2.3:9000"}
+	if mode, host, _, err := noMode.Target(); err != nil || mode != "caller" || host != "10.1.2.3" {
+		t.Errorf("default mode: %s %s %v", mode, host, err)
+	}
+	for url, want := range map[string]string{
+		"udp://1.2.3.4:9000":          "srt://",
+		"srt://1.2.3.4":               "port",
+		"srt://1.2.3.4:9000?mode=pub": "unknown mode",
+		"srt://:9000?mode=caller":     "needs a host",
+	} {
+		bad := SrtEndpoint{UseCustomURL: true, CustomURL: url}
+		if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: got %v, want error containing %q", url, err, want)
+		}
+	}
+}
+
+func TestSaveStripsPassphraseFromCustomURL(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cfg.json")
+	cfg := DefaultConfig()
+	cfg.SrtOut.UseCustomURL = true
+	cfg.SrtOut.CustomURL = "srt://h:1?mode=caller&passphrase=0123456789&latency=20000"
+	if err := SaveConfig(cfg, path); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := LoadConfig(path)
+	if got.SrtOut.CustomURL != "srt://h:1?mode=caller&latency=20000" || !got.SrtOut.UseCustomURL {
+		t.Errorf("saved %q", got.SrtOut.CustomURL)
+	}
+	cfg.SavePassphrases = true
+	_ = SaveConfig(cfg, path)
+	if got, _ = LoadConfig(path); got.SrtOut.CustomURL != cfg.SrtOut.CustomURL {
+		t.Errorf("with Save passphrases: %q", got.SrtOut.CustomURL)
+	}
+}
+
+func TestFFmpegArgs(t *testing.T) {
+	has := func(args []string, want ...string) bool {
+		s := " " + strings.Join(args, " ") + " "
+		return strings.Contains(s, " "+strings.Join(want, " ")+" ")
+	}
+	cfg := DefaultConfig()
+	in := newSrtSource(cfg, "ffmpeg", nil, nil).command()
+	if !has(in, "-probesize", "32768") || has(in, "-probesize", "32") {
+		t.Errorf("low-latency start: %v", in)
+	}
+	cfg.RawLowLatency = true
+	in = newSrtSource(cfg, "ffmpeg", nil, nil).command()
+	if !has(in, "-fflags", "nobuffer", "-flags", "low_delay", "-probesize", "32", "-analyzeduration", "0") {
+		t.Errorf("raw low latency: %v", in)
+	}
+	cfg.Codec = "Opus"
+	out := newSender(cfg, "ffmpeg", nil).command()
+	for _, want := range [][]string{
+		{"-pes_payload_size", "0"}, {"-muxdelay", "0", "-muxpreload", "0"}, {"-flush_packets", "1"},
+		{"-application", "lowdelay", "-frame_duration", "10"},
+	} {
+		if !has(out, want...) {
+			t.Errorf("sender lacks %v: %v", want, out)
+		}
+	}
+	if !strings.Contains(out[len(out)-1], "transtype=live") {
+		t.Errorf("sender URL: %s", out[len(out)-1])
 	}
 }
 
