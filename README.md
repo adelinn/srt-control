@@ -1,6 +1,6 @@
 # SRT Audio Bridge
 
-Receive audio over SRT (or from a local input), listen to it on any output device, and forward it to another SRT destination. One self-contained program with a desktop GUI and a headless mode, written in Go. GitHub Actions builds it for Windows (amd64); macOS is planned.
+Listen to an SRT audio stream on any output device while sending a local input (a mic or line-in) to an SRT destination, both at the same time. It can also relay the SRT stream onward instead. One self-contained program with a desktop GUI and a headless mode, written in Go. GitHub Actions builds it for Windows (amd64); macOS is planned.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/screenshot-dark.png">
@@ -8,9 +8,19 @@ Receive audio over SRT (or from a local input), listen to it on any output devic
 </picture>
 
 ```
-SRT in ----ffmpeg decode----> PCM 48 kHz s16 stereo --+--> monitor output device
-local input device ---------------------------------->+--> ffmpeg encode --> SRT out
+inputs (both can run at once)                       outputs (each picks one input)
+
+SRT in --ffmpeg decode--> PCM 48 kHz s16 stereo --+    Monitor  --> output device
+                                                  +--> (plays SRT in or local input)
+local input device (mic, line-in) ----------------+    SRT out  --> ffmpeg encode --> SRT
+                                                       (sends local input or SRT in)
 ```
+
+| Setup | Monitor plays | SRT output sends |
+|---|---|---|
+| Hear the programme feed, send your mic (default) | SRT input | Local input |
+| Relay: hear the stream and forward it | SRT input | SRT input |
+| Send your mic and hear yourself | Local input | Local input |
 
 ffmpeg does the SRT, decoding and encoding. Audio devices go through [miniaudio](https://miniaud.io) (compiled into the program): WASAPI, DirectSound or MME on Windows, Core Audio on macOS, PulseAudio or ALSA on Linux. It converts sample rate and channel count, so any device works.
 
@@ -46,10 +56,10 @@ Settings are saved to `~/.srt_audio_bridge.json` when you press Start and when y
 
 ## Behaviour
 
-- **Source:** SRT (caller, listener or rendezvous, with latency, passphrase, stream ID) or a local input device. With an audio+video SRT feed, the first audio track is used.
-- **Monitor:** output device, volume, mute and buffer size can be changed while running. **Devices** rescans without stopping.
-- **SRT out:** MPEG-TS with AAC, MP2, Opus or PCM (SMPTE 302M). Keeps the link up with silence while the source is down.
-- **Reconnects:** SRT in and SRT out reconnect on their own and independently, so a dead destination never stops monitoring.
+- **Inputs:** SRT (caller, listener or rendezvous, with latency, passphrase, stream ID) and a local input device, each with its own level meter. An input only runs while an output uses it. With an audio+video SRT feed, the first audio track is used.
+- **Monitor:** what it plays (SRT input or local input), output device, volume, mute and buffer size can all be changed while running. **Devices** rescans without stopping. Inputs aren't mixed: the monitor plays one at a time.
+- **SRT out:** MPEG-TS with AAC, MP2, Opus or PCM (SMPTE 302M). Keeps the link up with silence while its input is down. What it sends and its settings apply when you press Start or Restart.
+- **Reconnects:** SRT in and SRT out reconnect on their own and independently, so a dead destination never stops monitoring, and a dropped programme feed never stops your mic going out.
 - **Latency:** bursts of old audio (after a reconnect or ffmpeg's start-up probe) are dropped instead of becoming permanent delay. Measured end to end with two 120 ms SRT hops: about 400 ms with AAC, MP2 or Opus, about 340 ms with PCM.
 - **Shutdown:** closing the window, Ctrl+C or SIGTERM stops ffmpeg cleanly. On Windows, ffmpeg is also ended if the app crashes or is killed, so no stray ffmpeg keeps holding an SRT port.
 
@@ -81,9 +91,13 @@ You need Go 1.24+ and a C compiler, because miniaudio and the GUI toolkit ([Fyne
 ## Test
 
 ```
-go test ./...                                                  # unit tests + end-to-end relay
-go test ./internal/bridge -run Relay -v -args -relay.codec=Opus   # another output codec
-go test -short ./...                                           # skip the end-to-end relay
+go test ./...                                                  # unit tests + end-to-end tests
+go test ./internal/bridge -run Talkback -v                     # hear SRT in while sending the mic
+go test ./internal/bridge -run Relay -v -args -relay.codec=Opus   # relay with another output codec
+go test -short ./...                                           # skip the end-to-end tests
 ```
 
-The end-to-end test sends tone pulses over SRT through the engine (monitoring off) to a receiver, once with the bridge calling the destination and once with the destination joining 5 s late. It checks every pulse arrives intact within the latency limit. It needs ffmpeg with SRT, but no sound card.
+The end-to-end tests run real ffmpeg and SRT but need no sound card:
+
+- **Talkback:** a programme feed arrives over SRT while a mic tone goes out, at the same time. The test checks that the monitor plays the feed, the far end receives the mic, and switching the monitor to the mic works while running. The mic and monitor are stand-ins.
+- **Relay:** tone pulses go over SRT through the engine to a receiver, once with the bridge calling the destination and once with the destination joining 5 s late. It checks every pulse arrives intact within the latency limit.

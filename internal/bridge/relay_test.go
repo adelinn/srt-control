@@ -82,7 +82,7 @@ func runRelay(t *testing.T, ffmpeg, outMode string, joinAfter time.Duration, inP
 	}
 	cfg := DefaultConfig()
 	cfg.FFmpeg = ffmpeg
-	cfg.Source = "srt"
+	cfg.SendSource = FromSRT // relay
 	cfg.SrtIn = SrtEndpoint{Mode: "listener", Port: inPort, LatencyMs: 120}
 	cfg.MonitorEnabled = false
 	cfg.SendEnabled = true

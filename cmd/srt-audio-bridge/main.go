@@ -116,7 +116,7 @@ func runHeadless(configPath string) int {
 		for _, c := range []struct {
 			name string
 			s    bridge.ComponentStatus
-		}{{"source", st.Source}, {"monitor", st.Monitor}, {"sender", st.Sender}} {
+		}{{"srt in", st.SrtIn}, {"input", st.Input}, {"monitor", st.Monitor}, {"sender", st.Sender}} {
 			p := c.name + ": " + c.s.State
 			if c.s.Detail != "" {
 				p += " (" + c.s.Detail + ")"
@@ -129,8 +129,17 @@ func runHeadless(configPath string) int {
 		}
 		peaks := engine.TakePeaks()
 		if n%30 == 0 {
-			log(fmt.Sprintf("levels %.1f dB  %.1f dB",
-				20*math.Log10(max(peaks[0], 1e-5)), 20*math.Log10(max(peaks[1], 1e-5))))
+			db := func(p [bridge.Channels]float64) string {
+				return fmt.Sprintf("%.1f / %.1f dB", 20*math.Log10(max(p[0], 1e-5)), 20*math.Log10(max(p[1], 1e-5)))
+			}
+			var levels []string
+			if st.SrtIn.State != "off" {
+				levels = append(levels, "srt in "+db(peaks.SrtIn))
+			}
+			if st.Input.State != "off" {
+				levels = append(levels, "input "+db(peaks.Input))
+			}
+			log("levels: " + strings.Join(levels, " | "))
 		}
 	}
 }

@@ -12,57 +12,116 @@ import (
 // ComponentStatus is what a status light shows.
 type ComponentStatus struct{ State, Detail string }
 
-// Status of the three parts of the engine. State "off" means not in use.
-type Status struct{ Source, Monitor, Sender ComponentStatus }
+// Status of the two inputs and two outputs. State "off" means not running.
+type Status struct{ SrtIn, Input, Monitor, Sender ComponentStatus }
 
-// Engine wires a source to the monitor and the SRT sender. It knows nothing
-// about the GUI, so headless mode uses it as is.
-type Engine struct {
-	cfg     Config
-	log     func(string)
-	running atomic.Bool
+// Peaks per input, 0..1 per channel.
+type Peaks struct{ SrtIn, Input [Channels]float64 }
 
-	srcMu   sync.Mutex
-	source  source
-	monMu   sync.Mutex // serializes monitor changes
-	monitor atomic.Pointer[monitorSink]
-	sender  atomic.Pointer[srtSender]
+type input int
 
-	peakMu sync.Mutex
-	peak   [Channels]float64
+const (
+	inSRT input = iota
+	inDevice
+	numInputs
+)
 
-	// real-time governor, only touched by the source's thread
+func parseInput(s string) input {
+	if s == FromDevice {
+		return inDevice
+	}
+	return inSRT
+}
+
+// monitorOut is the monitor as the engine sees it (a fake in tests).
+type monitorOut interface {
+	push([]byte)
+	setVolume(volume float64, muted bool)
+	stop()
+	status() (string, string)
+}
+
+// Constructors for the parts that need a sound card; tests replace them.
+var (
+	openInputDevice = func(backend, name string, onPCM func([]byte), log func(string)) (source, error) {
+		d, err := newDeviceSource(backend, name, onPCM, log)
+		if err != nil {
+			return nil, err
+		}
+		return d, nil
+	}
+	openMonitor = func(backend, name string, bufferMs int, volume float64, muted bool, log func(string)) (monitorOut, error) {
+		m, err := newMonitor(backend, name, bufferMs, volume, muted, log)
+		if err != nil {
+			return nil, err
+		}
+		return m, nil
+	}
+)
+
+// inputPath is one input with its real-time governor and peak meter.
+type inputPath struct {
+	name string
+	src  source // nil while not running; guarded by Engine.mu
+
+	// governor state, only touched by this input's own thread
 	clockRef        time.Time
 	clockFrames     int
 	dropped         int
 	droppedLoggedAt time.Time
+
+	peakMu sync.Mutex
+	peak   [Channels]float64
+}
+
+type monitorRef struct{ out monitorOut }
+
+// Engine runs up to two inputs (SRT in, local input device) at the same time
+// and routes each output to one of them: the monitor plays one, SRT out sends
+// one. It knows nothing about the GUI, so headless mode uses it as is.
+type Engine struct {
+	cfg     Config
+	log     func(string)
+	running atomic.Bool
+	ffmpeg  string
+
+	mu          sync.Mutex // serializes Start, Stop and monitor changes
+	paths       [numInputs]inputPath
+	monitor     atomic.Pointer[monitorRef]
+	monitorFrom atomic.Int32 // input the monitor plays
+	sender      atomic.Pointer[srtSender]
+	sendFrom    input // input SRT out sends; fixed while running
 }
 
 // NewEngine prepares an engine. log must be safe to call from any goroutine;
 // passphrases are masked before it sees a message.
 func NewEngine(cfg Config, log func(string)) *Engine {
-	return &Engine{cfg: cfg, log: func(msg string) { log(MaskSecrets(msg)) }}
+	cfg.normalize()
+	e := &Engine{cfg: cfg, log: func(msg string) { log(MaskSecrets(msg)) }}
+	e.paths[inSRT].name = "SRT in"
+	e.paths[inDevice].name = "Local input"
+	return e
 }
 
 // Running reports whether Start succeeded and Stop hasn't been called.
 func (e *Engine) Running() bool { return e.running.Load() }
 
-// Start validates the settings and starts monitor, sender and source.
+// Start validates the settings, then starts the outputs that are on and the
+// inputs they use.
 func (e *Engine) Start() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	cfg := e.cfg
-	ffmpeg := ""
-	if cfg.Source == "srt" || cfg.SendEnabled {
-		var err error
-		if ffmpeg, err = ResolveFFmpeg(cfg.FFmpeg, e.log); err != nil {
+	monFrom, sendFrom := parseInput(cfg.MonitorSource), parseInput(cfg.SendSource)
+	uses := func(in input) bool {
+		return (cfg.MonitorEnabled && monFrom == in) || (cfg.SendEnabled && sendFrom == in)
+	}
+	if !cfg.MonitorEnabled && !cfg.SendEnabled {
+		return errors.New("nothing to do: turn on Monitor or Send over SRT")
+	}
+	if uses(inSRT) {
+		if err := e.checkSrtIn(); err != nil {
 			return err
-		}
-	}
-	if cfg.Source != "srt" && cfg.Source != "device" {
-		return fmt.Errorf("unknown source '%s'", cfg.Source)
-	}
-	if cfg.Source == "srt" {
-		if err := cfg.SrtIn.Validate(); err != nil {
-			return fmt.Errorf("SRT in: %w", err)
 		}
 	}
 	if cfg.SendEnabled {
@@ -73,119 +132,173 @@ func (e *Engine) Start() error {
 			return fmt.Errorf("unknown codec %s", cfg.Codec)
 		}
 	}
-	if cfg.Source == "srt" && cfg.SendEnabled && cfg.SrtIn.Mode == "listener" &&
-		cfg.SrtOut.Mode == "listener" && cfg.SrtIn.Port == cfg.SrtOut.Port {
-		return errors.New("SRT in and SRT out can't both listen on the same port")
+	if uses(inSRT) || cfg.SendEnabled {
+		var err error
+		if e.ffmpeg, err = ResolveFFmpeg(cfg.FFmpeg, e.log); err != nil {
+			return err
+		}
 	}
 
+	e.sendFrom = sendFrom
+	e.monitorFrom.Store(int32(monFrom))
 	fail := func(err error) error {
-		e.Stop()
+		e.stopLocked()
 		return err
 	}
 	if cfg.MonitorEnabled {
-		m, err := newMonitor(cfg.HostAPI, cfg.MonitorDevice, cfg.MonitorBufferMs, cfg.MonitorVolume, cfg.MonitorMuted, e.log)
+		m, err := openMonitor(cfg.HostAPI, cfg.MonitorDevice, cfg.MonitorBufferMs, cfg.MonitorVolume, cfg.MonitorMuted, e.log)
 		if err != nil {
 			return fail(fmt.Errorf("monitor: %w", err))
 		}
-		e.monitor.Store(m)
+		e.monitor.Store(&monitorRef{m})
 	}
 	if cfg.SendEnabled {
-		s := newSender(cfg, ffmpeg, e.log)
+		s := newSender(cfg, e.ffmpeg, e.log)
 		e.sender.Store(s)
 		s.start()
 	}
-	var src source
-	if cfg.Source == "srt" {
-		src = newSrtSource(cfg, ffmpeg, e.onPCM, e.log)
-	} else {
-		d, err := newDeviceSource(cfg.HostAPI, cfg.InputDevice, e.onPCM, e.log)
-		if err != nil {
-			return fail(fmt.Errorf("input: %w", err))
+	for in := input(0); in < numInputs; in++ {
+		if uses(in) {
+			if err := e.startInput(in); err != nil {
+				return fail(err)
+			}
 		}
-		src = d
-	}
-	e.srcMu.Lock()
-	e.source = src
-	e.srcMu.Unlock()
-	if err := src.start(); err != nil {
-		return fail(err)
 	}
 	e.running.Store(true)
 	return nil
 }
 
+func (e *Engine) checkSrtIn() error {
+	if err := e.cfg.SrtIn.Validate(); err != nil {
+		return fmt.Errorf("SRT in: %w", err)
+	}
+	if e.cfg.SendEnabled && e.cfg.SrtIn.Mode == "listener" && e.cfg.SrtOut.Mode == "listener" &&
+		e.cfg.SrtIn.Port == e.cfg.SrtOut.Port {
+		return errors.New("SRT in and SRT out can't both listen on the same port")
+	}
+	return nil
+}
+
+// startInput starts an input unless it is already running. Caller holds mu.
+func (e *Engine) startInput(in input) error {
+	p := &e.paths[in]
+	if p.src != nil {
+		return nil
+	}
+	onPCM := func(data []byte) { e.onPCM(in, data) }
+	var src source
+	switch in {
+	case inSRT:
+		if err := e.checkSrtIn(); err != nil {
+			return err
+		}
+		if e.ffmpeg == "" {
+			f, err := ResolveFFmpeg(e.cfg.FFmpeg, e.log)
+			if err != nil {
+				return err
+			}
+			e.ffmpeg = f
+		}
+		src = newSrtSource(e.cfg, e.ffmpeg, onPCM, e.log)
+	case inDevice:
+		d, err := openInputDevice(e.cfg.HostAPI, e.cfg.InputDevice, onPCM, e.log)
+		if err != nil {
+			return fmt.Errorf("local input: %w", err)
+		}
+		src = d
+	}
+	if err := src.start(); err != nil {
+		src.stop()
+		return err
+	}
+	p.src = src
+	return nil
+}
+
 // Stop stops everything. It is safe to call more than once.
 func (e *Engine) Stop() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.stopLocked()
+}
+
+func (e *Engine) stopLocked() {
 	e.running.Store(false)
-	e.srcMu.Lock()
-	src := e.source
-	e.source = nil
-	e.srcMu.Unlock()
-	if src != nil {
-		src.stop()
+	for in := range e.paths {
+		if src := e.paths[in].src; src != nil {
+			src.stop()
+			e.paths[in].src = nil
+		}
 	}
 	if s := e.sender.Swap(nil); s != nil {
 		s.stop()
 	}
-	e.monMu.Lock()
 	if m := e.monitor.Swap(nil); m != nil {
-		m.stop()
+		m.out.stop()
 	}
-	e.monMu.Unlock()
 }
 
-// SetMonitor switches monitoring on or off, or to another audio API, device or
-// buffer size, while running.
-func (e *Engine) SetMonitor(enabled bool, backend, device string, bufferMs int) error {
-	e.monMu.Lock()
-	defer e.monMu.Unlock()
+// SetMonitor switches monitoring on or off, to the other input, or to another
+// audio API, device or buffer size, while running. An input that isn't
+// running yet is started.
+func (e *Engine) SetMonitor(enabled bool, from, backend, device string, bufferMs int) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	if old := e.monitor.Swap(nil); old != nil {
-		old.stop()
+		old.out.stop()
 	}
-	e.cfg.MonitorEnabled, e.cfg.MonitorDevice, e.cfg.MonitorBufferMs = enabled, device, bufferMs
+	in := parseInput(from)
+	e.monitorFrom.Store(int32(in))
+	e.cfg.MonitorEnabled, e.cfg.MonitorSource = enabled, from
+	e.cfg.MonitorDevice, e.cfg.MonitorBufferMs = device, bufferMs
 	if !enabled || !e.running.Load() {
 		return nil
 	}
-	m, err := newMonitor(backend, device, bufferMs, e.cfg.MonitorVolume, e.cfg.MonitorMuted, e.log)
+	if err := e.startInput(in); err != nil {
+		return err
+	}
+	m, err := openMonitor(backend, device, bufferMs, e.cfg.MonitorVolume, e.cfg.MonitorMuted, e.log)
 	if err != nil {
 		return err
 	}
-	e.monitor.Store(m)
+	e.monitor.Store(&monitorRef{m})
 	return nil
 }
 
 // SetVolume changes monitor volume and mute while running.
 func (e *Engine) SetVolume(volume float64, muted bool) {
-	e.monMu.Lock()
-	defer e.monMu.Unlock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	e.cfg.MonitorVolume, e.cfg.MonitorMuted = volume, muted
 	if m := e.monitor.Load(); m != nil {
-		m.setVolume(volume, muted)
+		m.out.setVolume(volume, muted)
 	}
 }
 
-// onPCM is the fan-out point for every block of source audio.
-func (e *Engine) onPCM(data []byte) {
+// onPCM handles every block of audio from one input.
+func (e *Engine) onPCM(in input, data []byte) {
+	p := &e.paths[in]
 	frames := len(data) / FrameBytes
 	now := time.Now()
 	// Real-time governor: after a probe or a reconnect, ffmpeg can hand over a
-	// burst of old audio at once. Passing it on would add that much latency to
-	// the monitor and to everything downstream, so drop what's too early.
-	ahead := func(f int) float64 { return float64(f)/Rate - now.Sub(e.clockRef).Seconds() }
-	if e.clockRef.IsZero() || ahead(e.clockFrames) < -0.5 {
-		e.clockRef, e.clockFrames = now, 0
+	// burst of old audio at once (and an unclocked device can flood). Passing
+	// it on would add that much latency to everything downstream, so drop
+	// what's too early.
+	ahead := func(f int) float64 { return float64(f)/Rate - now.Sub(p.clockRef).Seconds() }
+	if p.clockRef.IsZero() || ahead(p.clockFrames) < -0.5 {
+		p.clockRef, p.clockFrames = now, 0
 	}
-	if ahead(e.clockFrames+frames) > maxAhead {
-		e.dropped += frames
+	if ahead(p.clockFrames+frames) > maxAhead {
+		p.dropped += frames
 		return
 	}
-	if e.dropped > 0 && now.Sub(e.droppedLoggedAt) > 10*time.Second { // report at most every 10 s
-		if ms := e.dropped * 1000 / Rate; ms >= 20 {
-			e.log(fmt.Sprintf("Dropped %d ms of audio that arrived faster than real time (keeps latency low)", ms))
+	if p.dropped > 0 && now.Sub(p.droppedLoggedAt) > 10*time.Second { // report at most every 10 s
+		if ms := p.dropped * 1000 / Rate; ms >= 20 {
+			e.log(fmt.Sprintf("%s: dropped %d ms of audio that arrived faster than real time (keeps latency low)", p.name, ms))
 		}
-		e.dropped, e.droppedLoggedAt = 0, now
+		p.dropped, p.droppedLoggedAt = 0, now
 	}
-	e.clockFrames += frames
+	p.clockFrames += frames
 
 	var peak [Channels]int
 	for i := 0; i+FrameBytes <= len(data); i += FrameBytes {
@@ -197,43 +310,54 @@ func (e *Engine) onPCM(data []byte) {
 			peak[ch] = max(peak[ch], v)
 		}
 	}
-	e.peakMu.Lock()
+	p.peakMu.Lock()
 	for ch := range peak {
-		e.peak[ch] = max(e.peak[ch], float64(peak[ch])/32768)
+		p.peak[ch] = max(p.peak[ch], float64(peak[ch])/32768)
 	}
-	e.peakMu.Unlock()
+	p.peakMu.Unlock()
 
-	if m := e.monitor.Load(); m != nil {
-		m.push(data)
+	if input(e.monitorFrom.Load()) == in {
+		if m := e.monitor.Load(); m != nil {
+			m.out.push(data)
+		}
 	}
-	if s := e.sender.Load(); s != nil {
-		s.push(data)
+	if e.sendFrom == in {
+		if s := e.sender.Load(); s != nil {
+			s.push(data)
+		}
 	}
 }
 
-// TakePeaks returns the per-channel peak (0..1) since the last call.
-func (e *Engine) TakePeaks() [Channels]float64 {
-	e.peakMu.Lock()
-	defer e.peakMu.Unlock()
-	p := e.peak
-	e.peak = [Channels]float64{}
-	return p
+// TakePeaks returns each input's per-channel peak (0..1) since the last call.
+func (e *Engine) TakePeaks() Peaks {
+	take := func(p *inputPath) [Channels]float64 {
+		p.peakMu.Lock()
+		defer p.peakMu.Unlock()
+		v := p.peak
+		p.peak = [Channels]float64{}
+		return v
+	}
+	return Peaks{SrtIn: take(&e.paths[inSRT]), Input: take(&e.paths[inDevice])}
 }
 
-// Snapshot returns the status of source, monitor and sender.
+// Snapshot returns the status of both inputs and both outputs.
 func (e *Engine) Snapshot() Status {
 	get := func(c interface{ status() (string, string) }) ComponentStatus {
 		state, detail := c.status()
 		return ComponentStatus{state, detail}
 	}
-	st := Status{Source: ComponentStatus{State: "off"}, Monitor: ComponentStatus{State: "off"}, Sender: ComponentStatus{State: "off"}}
-	e.srcMu.Lock()
-	if e.source != nil {
-		st.Source = get(e.source)
+	off := ComponentStatus{State: "off"}
+	st := Status{SrtIn: off, Input: off, Monitor: off, Sender: off}
+	e.mu.Lock()
+	if src := e.paths[inSRT].src; src != nil {
+		st.SrtIn = get(src)
 	}
-	e.srcMu.Unlock()
+	if src := e.paths[inDevice].src; src != nil {
+		st.Input = get(src)
+	}
+	e.mu.Unlock()
 	if m := e.monitor.Load(); m != nil {
-		st.Monitor = get(m)
+		st.Monitor = get(m.out)
 	}
 	if s := e.sender.Load(); s != nil {
 		st.Sender = get(s)
